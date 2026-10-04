@@ -1,0 +1,1602 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>成績処理システム</title>
+  
+  <!-- 外部ライブラリの読み込み -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://cdn.jsdelivr.net/npm/remixicon@4.2.0/fonts/remixicon.css" rel="stylesheet" />
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useMemo, useRef, Fragment, StrictMode } = React;
+    const { createRoot } = ReactDOM;
+
+    // --- ユーティリティ ---
+    const generateId = (prefix) => `${prefix}_${Math.random().toString(36).slice(2, 9)}`;
+    const round1 = (val) => Math.round(val * 10) / 10;
+    const round3 = (val) => String(Number.isInteger(val) ? val : Math.round(val * 1000) / 1000);
+    const parseFloatSafe = (val) => { const num = parseFloat(val); return Number.isFinite(num) ? num : null; };
+    const isWithinRange = (val, min, max) => !(val == null || (min != null && val < min) || (max != null && val > max));
+    const calculateAverage = (arr) => { const valid = arr.filter(x => x != null); return valid.length ? valid.reduce((sum, x) => sum + x, 0) / valid.length : null; };
+
+    // --- 定数 ---
+    const STORAGE_KEY = 'grade-mgmt-app-state-v2';
+    const VIEWPOINTS = [{ key: 'k', label: '知識' }, { key: 's', label: '思考' }, { key: 't', label: '態度' }];
+    const TABS = [
+      { id: 'input', name: '得点入力', icon: 'ri-edit-line' },
+      { id: 'results', name: '成績一覧', icon: 'ri-bar-chart-2-line' },
+      { id: 'settings', name: '基本設定', icon: 'ri-settings-3-line' }
+    ];
+    const COL_LABELS = { no: 'No', cls: 'クラス', course: 'コース', name: '氏名' };
+    const GRADE_COLORS = { 5: 'bg-emerald-500', 4: 'bg-lime-500', 3: 'bg-amber-400', 2: 'bg-orange-400', 1: 'bg-rose-400' };
+    const getGradeColor = (grade) => GRADE_COLORS[grade] ?? 'bg-slate-400';
+    const TONE_CLASSES = {
+      emerald: 'bg-emerald-100 text-emerald-700 border border-emerald-200',
+      teal: 'bg-teal-100 text-teal-700 border border-teal-200',
+      lime: 'bg-lime-100 text-lime-700 border border-lime-200',
+      amber: 'bg-amber-100 text-amber-700 border border-amber-200',
+      orange: 'bg-orange-100 text-orange-700 border border-orange-200',
+      rose: 'bg-rose-100 text-rose-700 border border-rose-200',
+      slate: 'bg-slate-100 text-slate-700 border border-slate-200'
+    };
+    const getToneClass = (tone) => TONE_CLASSES[tone] ?? TONE_CLASSES.slate;
+
+    // --- Tailwind クラス ---
+    const InputClass = "w-full text-sm border border-slate-300 rounded-md px-2.5 py-1.5 focus:outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100 transition";
+    const SmallInputClass = "w-16 text-sm text-center border border-slate-300 rounded-md px-1 py-1 focus:outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100 transition";
+    const ButtonClass = "px-3 py-1.5 text-xs rounded-md whitespace-nowrap cursor-pointer transition inline-flex items-center gap-1.5";
+
+    // --- 計算式ノード生成 ---
+    const createFactorNode = (factor) => ({ id: generateId('fn'), kind: 'factor', factor });
+    const createNumberNode = (value) => ({ id: generateId('fn'), kind: 'number', value });
+    const createOpNode = (op, left, right) => ({ id: generateId('fn'), kind: 'op', op, left, right });
+    const createGroupNode = (child) => ({ id: generateId('fn'), kind: 'group', child });
+
+    const createFormulaFromFactors = (factors) => {
+      if (!Array.isArray(factors) || factors.length === 0) return createNumberNode(0);
+      let root = createNumberNode(0);
+      factors.forEach((f, i) => {
+        let term = createNumberNode(typeof f.coefficient === 'number' ? f.coefficient : 1);
+        (f.factors ?? []).forEach(factorName => {
+          if (factorName !== 'constant') term = createOpNode('*', term, createFactorNode(factorName));
+        });
+        root = i === 0 ? term : createOpNode('+', root, term);
+      });
+      return root;
+    };
+
+    const defaultAttitudeFormula = () => createOpNode('+', createOpNode('+', createFactorNode('initialPoint'), createOpNode('*', createFactorNode('coef'), createFactorNode('combinedExamPct'))), createFactorNode('regularT'));
+    const defaultExpectedFormula = () => createOpNode('*', createFactorNode('rawScore'), createFactorNode('rate'));
+
+    // --- 初期状態生成 ---
+    const createDefaultState = () => {
+      const term1 = generateId('term'), term2 = generateId('term');
+      const exam1 = generateId('exam'), exam2 = generateId('exam'), exam3 = generateId('exam'), exam4 = generateId('exam');
+      const stu1 = generateId('stu'), stu2 = generateId('stu'), stu3 = generateId('stu'), stu4 = generateId('stu'), stu5 = generateId('stu');
+
+      const regularItems = [
+        { id: generateId('reg'), termId: term1, vp: 'k', name: '知識の小テスト①', max: 10 },
+        { id: generateId('reg'), termId: term1, vp: 'k', name: '知識の小テスト②', max: 10 },
+        { id: generateId('reg'), termId: term1, vp: 's', name: '思考レポート', max: 20 },
+        { id: generateId('reg'), termId: term1, vp: 't', name: '態度チェック', max: 30 },
+        { id: generateId('reg'), termId: term2, vp: 'k', name: '知識の小テスト①', max: 10 },
+        { id: generateId('reg'), termId: term2, vp: 'k', name: '知識の小テスト②', max: 10 },
+        { id: generateId('reg'), termId: term2, vp: 's', name: '思考レポート', max: 20 },
+        { id: generateId('reg'), termId: term2, vp: 't', name: '態度チェック', max: 30 }
+      ];
+
+      const getRegScores = (termId, k1, k2, s, t) => {
+        const items = regularItems.filter(item => item.termId === termId);
+        return { [items[0].id]: k1, [items[1].id]: k2, [items[2].id]: s, [items[3].id]: t };
+      };
+
+      const createDefaultExamScore = (k, s) => ({ status: 'attend', rate: 1, k, s, t: null });
+
+      return {
+        settings: {
+          maxScore: 100,
+          attitudeFormula: defaultAttitudeFormula(),
+          expectedFormula: defaultExpectedFormula(),
+          terms: [
+            { id: term1, name: '前期', weights: { k: { exam: 0.5, regular: 0.5 }, s: { exam: 0.5, regular: 0.5 }, t: { exam: 0.3, regular: 0.7 } }, attitudeInitial: 30, attitudeCoef: 0.3 },
+            { id: term2, name: '後期', weights: { k: { exam: 0.5, regular: 0.5 }, s: { exam: 0.5, regular: 0.5 }, t: { exam: 0.3, regular: 0.7 } }, attitudeInitial: 30, attitudeCoef: 0.3 }
+          ],
+          regularItems,
+          exams: [
+            { id: exam1, termId: term1, name: '前期中間', maxK: 60, maxS: 40, maxT: 0 },
+            { id: exam2, termId: term1, name: '前期期末', maxK: 60, maxS: 40, maxT: 0 },
+            { id: exam3, termId: term2, name: '後期中間', maxK: 60, maxS: 40, maxT: 0 },
+            { id: exam4, termId: term2, name: '後期期末', maxK: 60, maxS: 40, maxT: 0 }
+          ],
+          absences: [
+            { id: generateId('abs'), name: '無断', rate: 0 },
+            { id: generateId('abs'), name: '病', rate: 0.8 },
+            { id: generateId('abs'), name: '公等', rate: 0.9 }
+          ],
+          gradeScale: [
+            { id: generateId('gs'), label: 'A', minRatio: 0.75, value: 4, tone: 'emerald' },
+            { id: generateId('gs'), label: 'B+', minRatio: 0.5, value: 3, tone: 'teal' },
+            { id: generateId('gs'), label: 'B-', minRatio: 0.25, value: 2, tone: 'amber' },
+            { id: generateId('gs'), label: 'C', minRatio: 0, value: 1, tone: 'rose' }
+          ],
+          finalScale: [
+            { id: generateId('fs'), label: '5', minSum: 11, maxSum: 12 },
+            { id: generateId('fs'), label: '4', minSum: 9, maxSum: 10 },
+            { id: generateId('fs'), label: '3', minSum: 7, maxSum: 8 },
+            { id: generateId('fs'), label: '2', minSum: 5, maxSum: 6 },
+            { id: generateId('fs'), label: '1', minSum: 3, maxSum: 4 }
+          ]
+        },
+        students: [
+          { id: stu1, no: 1, cls: '1-A', course: '普通', name: '山田 太郎' },
+          { id: stu2, no: 2, cls: '1-A', course: '普通', name: '佐藤 花子' },
+          { id: stu3, no: 3, cls: '1-A', course: '理数', name: '鈴木 一郎' },
+          { id: stu4, no: 4, cls: '1-B', course: '普通', name: '高橋 美咲' },
+          { id: stu5, no: 5, cls: '1-B', course: '理数', name: '伊藤 健太' }
+        ],
+        examScores: {
+          [stu1]: { [exam1]: createDefaultExamScore(52, 34), [exam2]: createDefaultExamScore(45, 42), [exam3]: createDefaultExamScore(50, 33), [exam4]: createDefaultExamScore(48, 36) },
+          [stu2]: { [exam1]: createDefaultExamScore(48, 38), [exam2]: createDefaultExamScore(44, 46), [exam3]: createDefaultExamScore(52, 30), [exam4]: createDefaultExamScore(50, 40) },
+          [stu3]: { [exam1]: createDefaultExamScore(40, 28), [exam2]: createDefaultExamScore(38, 30), [exam3]: createDefaultExamScore(42, 28), [exam4]: createDefaultExamScore(40, 32) },
+          [stu4]: { [exam1]: createDefaultExamScore(56, 36), [exam2]: createDefaultExamScore(48, 48), [exam3]: createDefaultExamScore(55, 38), [exam4]: createDefaultExamScore(52, 42) },
+          [stu5]: { [exam1]: createDefaultExamScore(30, 20), [exam2]: createDefaultExamScore(26, 24), [exam3]: createDefaultExamScore(34, 22), [exam4]: createDefaultExamScore(32, 26) }
+        },
+        regularScores: {
+          [stu1]: { ...getRegScores(term1, 8, 7, 16, 28), ...getRegScores(term2, 9, 8, 17, 27) },
+          [stu2]: { ...getRegScores(term1, 9, 9, 18, 30), ...getRegScores(term2, 10, 9, 19, 29) },
+          [stu3]: { ...getRegScores(term1, 7, 6, 14, 22), ...getRegScores(term2, 8, 7, 15, 24) },
+          [stu4]: { ...getRegScores(term1, 10, 10, 20, 30), ...getRegScores(term2, 10, 10, 20, 30) },
+          [stu5]: { ...getRegScores(term1, 5, 4, 10, 18), ...getRegScores(term2, 6, 5, 11, 20) }
+        }
+      };
+    };
+
+    // --- マイグレーション ---
+    const migrateState = (state) => {
+      const settings = state.settings ?? {};
+      const terms = settings.terms ?? [];
+      
+      // 態度のマイグレーション
+      const formula = settings.attitudeFormula;
+      const isArray = Array.isArray(formula);
+      let initial = 30, coef = 0.3;
+      if (isArray) {
+        const constFactor = formula.find(f => (f.factors ?? []).includes('constant'));
+        const coefFactor = formula.find(f => (f.factors ?? []).includes('combinedExamPct') && !(f.factors ?? []).includes('coef'));
+        if (constFactor) initial = Math.abs(constFactor.coefficient ?? 0);
+        if (coefFactor) coef = Math.abs(coefFactor.coefficient ?? 0);
+      }
+      const newTerms = terms.map(t => ({
+        ...t,
+        attitudeInitial: typeof t.attitudeInitial === 'number' ? t.attitudeInitial : initial,
+        attitudeCoef: typeof t.attitudeCoef === 'number' ? t.attitudeCoef : coef
+      }));
+      const newAttitudeFormula = isArray ? createFormulaFromFactors(formula) : (formula ?? defaultAttitudeFormula());
+
+      // 平常点のマイグレーション
+      let newRegularItems = settings.regularItems;
+      let newRegularScores = state.regularScores ?? {};
+      if (!Array.isArray(settings.regularItems)) {
+        newRegularItems = [];
+        const map = {};
+        terms.forEach(term => {
+          const oldTerm = settings.terms?.find(t => t.id === term.id)?.regularMax;
+          map[term.id] = { k: '', s: '', t: '' };
+          ['k', 's', 't'].forEach(vp => {
+            const id = generateId('reg');
+            const max = oldTerm?.[vp] ?? (vp === 't' ? 30 : 100);
+            map[term.id][vp] = id;
+            newRegularItems.push({ id, termId: term.id, vp, name: vp === 'k' ? '知識の平常点' : vp === 's' ? '思考の平常点' : '態度の平常点', max });
+          });
+        });
+        if (Object.keys(newRegularScores).length > 0) {
+          const migratedScores = {};
+          Object.entries(newRegularScores).forEach(([stuId, scores]) => {
+            migratedScores[stuId] = {};
+            Object.entries(scores ?? {}).forEach(([termId, termScores]) => {
+              const m = map[termId];
+              if (m && termScores) {
+                ['k', 's', 't'].forEach(vp => {
+                  const val = termScores[vp];
+                  if (m[vp]) migratedScores[stuId][m[vp]] = typeof val === 'number' ? val : null;
+                });
+              }
+            });
+          });
+          newRegularScores = migratedScores;
+        }
+      }
+
+      const expFormula = settings.expectedFormula;
+      return {
+        ...state,
+        settings: {
+          ...settings,
+          maxScore: settings.maxScore ?? 100,
+          absences: settings.absences ?? [],
+          gradeScale: settings.gradeScale ?? [],
+          finalScale: settings.finalScale ?? [],
+          exams: settings.exams ?? [],
+          terms: newTerms,
+          regularItems: newRegularItems,
+          attitudeFormula: newAttitudeFormula,
+          expectedFormula: Array.isArray(expFormula) ? createFormulaFromFactors(expFormula) : (expFormula ?? defaultExpectedFormula())
+        },
+        students: (state.students ?? []).map(s => ({ ...s, course: s.course ?? '' })),
+        examScores: state.examScores ?? {},
+        regularScores: newRegularScores
+      };
+    };
+
+    // --- 状態管理フック ---
+    const useAppState = () => {
+      const [state, setState] = useState(() => {
+        try {
+          const saved = localStorage.getItem(STORAGE_KEY);
+          if (saved) return migrateState(JSON.parse(saved));
+        } catch (e) { console.warn('failed to load state', e); }
+        if (window.__INITIAL_STATE__) return migrateState(window.__INITIAL_STATE__);
+        return createDefaultState();
+      });
+
+      useEffect(() => {
+        try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch (e) { console.warn('failed to save state', e); }
+      }, [state]);
+
+      return { state, setState, reset: () => setState(createDefaultState()) };
+    };
+
+    const updateState = (setState) => (updater) => {
+      setState(prev => {
+        const next = structuredClone(prev);
+        updater(next);
+        return next;
+      });
+    };
+
+    // --- 成績計算ロジック ---
+    const getExamMax = (exam, vp) => vp === 'k' ? exam.maxK : vp === 's' ? exam.maxS : exam.maxT;
+    const isTransferred = (state, stuId) => {
+      const scores = state.examScores[stuId];
+      return scores ? Object.values(scores).some(s => s?.status === 'transfer') : false;
+    };
+    const getGrade = (ratio, state) => {
+      const scale = [...state.settings.gradeScale].sort((a, b) => b.minRatio - a.minRatio).find(s => ratio >= s.minRatio);
+      return scale ? { label: scale.label, value: scale.value, tone: scale.tone } : null;
+    };
+    const getFinalGrade = (sum, state) => {
+      const scale = [...state.settings.finalScale].sort((a, b) => b.minSum - a.minSum).find(s => sum >= s.minSum && sum <= s.maxSum);
+      return scale ? scale.label : null;
+    };
+
+    const getClassExamAvg = (state, stuId, examId, vp) => {
+      const stu = state.students.find(s => s.id === stuId);
+      if (!stu) return null;
+      let sum = 0, count = 0;
+      for (const s of state.students) {
+        if (s.cls !== stu.cls) continue;
+        const score = state.examScores[s.id]?.[examId];
+        if (!score || score.status !== 'attend') continue;
+        const val = score[vp];
+        if (typeof val === 'number') { sum += val; count += 1; }
+      }
+      return count > 0 ? sum / count : null;
+    };
+
+    const evaluateFactor = (state, factor, ctx) => {
+      switch (factor) {
+        case 'combinedExamPct': {
+          const exams = state.settings.exams.filter(e => e.termId === ctx.termId);
+          let scoreSum = 0, maxSum = 0;
+          for (const ex of exams) {
+            const max = ex.maxK + ex.maxS;
+            if (max <= 0) continue;
+            if (ex.maxK > 0) scoreSum += evaluateFormula(state, state.settings.expectedFormula, { ...ctx, examId: ex.id, vp: 'k' });
+            if (ex.maxS > 0) scoreSum += evaluateFormula(state, state.settings.expectedFormula, { ...ctx, examId: ex.id, vp: 's' });
+            maxSum += max;
+          }
+          return maxSum <= 0 ? null : (scoreSum / maxSum) * 100;
+        }
+        case 'examPctK':
+        case 'examPctS': {
+          const vp = factor === 'examPctK' ? 'k' : 's';
+          const exams = state.settings.exams.filter(e => e.termId === ctx.termId);
+          let scoreSum = 0, maxSum = 0;
+          for (const ex of exams) {
+            const max = getExamMax(ex, vp);
+            if (max <= 0) continue;
+            scoreSum += evaluateFormula(state, state.settings.expectedFormula, { ...ctx, examId: ex.id, vp });
+            maxSum += max;
+          }
+          return maxSum <= 0 ? null : (scoreSum / maxSum) * 100;
+        }
+        case 'regularK':
+        case 'regularS':
+        case 'regularT': {
+          const vp = factor.slice(-1).toLowerCase();
+          const items = state.settings.regularItems.filter(i => i.termId === ctx.termId && i.vp === vp);
+          let sum = 0, count = 0;
+          for (const item of items) {
+            const score = state.regularScores[ctx.studentId]?.[item.id];
+            if (typeof score === 'number') { sum += score; count += 1; }
+          }
+          return count > 0 ? sum : null;
+        }
+        case 'regularMaxK':
+        case 'regularMaxS':
+        case 'regularMaxT': {
+          const vp = factor.slice(-1).toLowerCase();
+          return state.settings.regularItems.filter(i => i.termId === ctx.termId && i.vp === vp && i.max > 0).reduce((sum, i) => sum + (i.max || 0), 0);
+        }
+        case 'rawScore': {
+          if (!ctx.examId || !ctx.vp) return null;
+          const val = state.examScores[ctx.studentId]?.[ctx.examId]?.[ctx.vp];
+          return typeof val === 'number' ? val : null;
+        }
+        case 'rate': return ctx.examId ? (state.examScores[ctx.studentId]?.[ctx.examId]?.rate ?? 1) : null;
+        case 'otherExamAvgPct': {
+          if (!ctx.examId || !ctx.vp) return null;
+          const otherExams = state.settings.exams.filter(e => e.termId === ctx.termId && e.id !== ctx.examId);
+          let totalScore = 0, totalMax = 0;
+          for (const ex of otherExams) {
+            const max = getExamMax(ex, ctx.vp);
+            if (max <= 0) continue;
+            const score = state.examScores[ctx.studentId]?.[ex.id]?.[ctx.vp];
+            if (typeof score === 'number') { totalScore += score; totalMax += max; }
+          }
+          return totalMax <= 0 ? null : (totalScore / totalMax) * 100;
+        }
+        case 'initialPoint': return state.settings.terms.find(t => t.id === ctx.termId)?.attitudeInitial ?? null;
+        case 'coef': return state.settings.terms.find(t => t.id === ctx.termId)?.attitudeCoef ?? null;
+        case 'otherExamScore': {
+          if (!ctx.examId || !ctx.vp) return null;
+          const otherExams = state.settings.exams.filter(e => e.termId === ctx.termId && e.id !== ctx.examId);
+          let sum = 0, count = 0;
+          for (const ex of otherExams) {
+            const score = state.examScores[ctx.studentId]?.[ex.id];
+            if (!score || score.status !== 'attend') continue;
+            const val = score[ctx.vp];
+            if (typeof val === 'number') { sum += val; count += 1; }
+          }
+          return count > 0 ? sum / count : null;
+        }
+        case 'thisExamClassAvg': return ctx.examId && ctx.vp ? getClassExamAvg(state, ctx.studentId, ctx.examId, ctx.vp) : null;
+        case 'otherExamClassAvg': {
+          if (!ctx.examId || !ctx.vp) return null;
+          const otherExams = state.settings.exams.filter(e => e.termId === ctx.termId && e.id !== ctx.examId);
+          let sum = 0, count = 0;
+          for (const ex of otherExams) {
+            const avg = getClassExamAvg(state, ctx.studentId, ex.id, ctx.vp);
+            if (avg != null) { sum += avg; count += 1; }
+          }
+          return count > 0 ? sum / count : null;
+        }
+        default: return null;
+      }
+    };
+
+    const evaluateFormulaNode = (state, node, ctx) => {
+      switch (node.kind) {
+        case 'factor': return evaluateFactor(state, node.factor, ctx);
+        case 'number': return node.value;
+        case 'group': return evaluateFormulaNode(state, node.child, ctx);
+        case 'op': {
+          const left = evaluateFormulaNode(state, node.left, ctx);
+          const right = evaluateFormulaNode(state, node.right, ctx);
+          if (node.op === '+' || node.op === '-') return node.op === '+' ? (left ?? 0) + (right ?? 0) : (left ?? 0) - (right ?? 0);
+          if (left == null || right == null) return null;
+          if (node.op === '*') return left * right;
+          if (right === 0) return null;
+          return left / right;
+        }
+      }
+    };
+
+    const evaluateFormula = (state, formula, ctx) => evaluateFormulaNode(state, formula, ctx) ?? 0;
+
+    const calculateTermResult = (state, stuId, term) => {
+      const viewpoints = {};
+      let sumValue = 0;
+      ['k', 's', 't'].forEach(vp => {
+        let ratio = 0, grade = null;
+        if (vp === 't') {
+          const score = evaluateFormula(state, state.settings.attitudeFormula, { studentId: stuId, termId: term.id });
+          ratio = Math.max(0, score / state.settings.maxScore);
+          grade = getGrade(ratio, state);
+        } else {
+          const examPct = evaluateFactor(state, vp === 'k' ? 'examPctK' : 'examPctS', { studentId: stuId, termId: term.id });
+          const regMax = evaluateFactor(state, vp === 'k' ? 'regularMaxK' : 'regularMaxS', { termId: term.id });
+          const regScoreValid = state.settings.regularItems.filter(i => i.termId === term.id && i.vp === vp && i.max > 0).reduce((sum, i) => {
+            const s = state.regularScores[stuId]?.[i.id];
+            return sum + (typeof s === 'number' ? s : 0);
+          }, 0);
+          const regPct = regMax > 0 ? (regScoreValid / regMax) * 100 : null;
+          
+          const wExam = term.weights[vp]?.exam ?? 0.5;
+          const wReg = term.weights[vp]?.regular ?? 0.5;
+          const wSum = wExam + wReg;
+          const rExam = wSum > 0 ? wExam / wSum : 0;
+          const rReg = wSum > 0 ? wReg / wSum : 0;
+          const pExam = examPct === null ? 0 : examPct * rExam;
+          const pReg = regPct === null ? 0 : regPct * rReg;
+          const validWeight = (examPct === null ? 0 : rExam) + (regPct === null ? 0 : rReg);
+          const baseRatio = validWeight > 0 ? (pExam + pReg) / validWeight : 0;
+          
+          const bonus = state.settings.regularItems.filter(i => i.termId === term.id && i.vp === vp && i.max <= 0).reduce((sum, i) => {
+            const s = state.regularScores[stuId]?.[i.id];
+            return sum + (typeof s === 'number' ? s : 0);
+          }, 0);
+          
+          ratio = (baseRatio + bonus) / 100;
+          grade = (validWeight > 0 || bonus !== 0) ? getGrade(ratio, state) : null;
+        }
+        const point = ratio * state.settings.maxScore;
+        viewpoints[vp] = { point, ratio, grade };
+        if (grade) sumValue += grade.value;
+      });
+
+      const exams = state.settings.exams.filter(e => e.termId === term.id);
+      let examSum = 0, examCount = 0;
+      for (const ex of exams) {
+        const score = state.examScores[stuId]?.[ex.id];
+        let exSum = 0, hasScore = false;
+        if (ex.maxK > 0 && typeof score?.k === 'number') { exSum += score.k; hasScore = true; }
+        if (ex.maxS > 0 && typeof score?.s === 'number') { exSum += score.s; hasScore = true; }
+        if (ex.maxT > 0 && typeof score?.t === 'number') { exSum += score.t; hasScore = true; }
+        if (hasScore) { examSum += exSum; examCount += 1; }
+      }
+
+      return {
+        termId: term.id,
+        termName: term.name,
+        viewpoints,
+        examAverage: examCount > 0 ? examSum / examCount : null,
+        sumValue,
+        finalLabel: getFinalGrade(sumValue, state)
+      };
+    };
+
+    const calculateAllResults = (state) => {
+      return state.students.map(stu => {
+        const transferred = isTransferred(state, stu.id);
+        const terms = transferred
+          ? state.settings.terms.map(t => ({
+              termId: t.id, termName: t.name,
+              viewpoints: { k: { point: 0, ratio: 0, grade: null }, s: { point: 0, ratio: 0, grade: null }, t: { point: 0, ratio: 0, grade: null } },
+              examAverage: null, sumValue: 0, finalLabel: null
+            }))
+          : state.settings.terms.map(t => calculateTermResult(state, stu.id, t));
+        
+        const validTerms = transferred ? [] : terms.filter(t => Object.values(t.viewpoints).some(vp => vp.grade));
+        const annualAverage = validTerms.length ? validTerms.reduce((sum, t) => sum + t.sumValue, 0) / validTerms.length : 0;
+        
+        return {
+          studentId: stu.id, no: stu.no, cls: stu.cls, course: stu.course, name: stu.name,
+          terms, annualLabel: transferred ? null : (validTerms.length ? getFinalGrade(annualAverage, state) : null),
+          annualAverage, transferred
+        };
+      });
+    };
+
+    // --- UI コンポーネント ---
+    const Section = ({ title, desc, icon, action, children, className = "" }) => (
+      <section className={`bg-white border border-slate-200 rounded-lg p-5 mb-5 ${className}`}>
+        {(title || action) && (
+          <div className="flex items-start justify-between mb-4 gap-4">
+            <div>
+              {title && (
+                <h3 className="text-base font-semibold text-slate-800 flex items-center gap-2">
+                  {icon && <span className="w-7 h-7 flex items-center justify-center rounded-md bg-emerald-100 text-emerald-700"><i className={`${icon} text-sm`}></i></span>}
+                  {title}
+                </h3>
+              )}
+              {desc && <p className="text-xs text-slate-500 mt-1 leading-relaxed">{desc}</p>}
+            </div>
+            {action}
+          </div>
+        )}
+        {children}
+      </section>
+    );
+
+    const Tabs = ({ tabs, current, onChange }) => (
+      <div className="flex gap-1 overflow-x-auto">
+        {tabs.map(tab => {
+          const active = tab.id === current;
+          return (
+            <button key={tab.id} onClick={() => onChange(tab.id)} className={`flex items-center gap-2 px-4 py-2.5 text-sm whitespace-nowrap cursor-pointer transition-colors border-b-2 ${active ? 'border-emerald-500 text-emerald-700 font-semibold' : 'border-transparent text-slate-500 hover:text-slate-800'}`}>
+              <i className={`${tab.icon} text-base w-4 h-4 flex items-center justify-center`}></i>
+              {tab.name}
+            </button>
+          );
+        })}
+      </div>
+    );
+
+    // --- 計算式エディタ ---
+    const FORMULA_FACTORS_ATTITUDE = [
+      { key: 'initialPoint', label: '初期付与点', unit: '点', desc: '学期ごとに設定する初期付与点' },
+      { key: 'coef', label: '換算係数', unit: '係数', desc: '学期ごとに設定する換算係数' },
+      { key: 'combinedExamPct', label: '知識+思考 得点率', unit: '%', desc: '知識点と思考点を合わせた得点率(認定率を反映)' },
+      { key: 'examPctK', label: '知識 得点率', unit: '%', desc: '知識点の得点率(認定率を反映)' },
+      { key: 'examPctS', label: '思考 得点率', unit: '%', desc: '思考点の得点率(認定率を反映)' },
+      { key: 'regularK', label: '平常点 知識', unit: '点', desc: '平常点(知識)の小テスト得点の合計' },
+      { key: 'regularS', label: '平常点 思考', unit: '点', desc: '平常点(思考)の小テスト得点の合計' },
+      { key: 'regularT', label: '平常点 態度', unit: '点', desc: '平常点(態度)の小テスト得点の合計' },
+      { key: 'regularMaxK', label: '平常点 知識 満点', unit: '点', desc: '平常点(知識)の小テストの満点合計' },
+      { key: 'regularMaxS', label: '平常点 思考 満点', unit: '点', desc: '平常点(思考)の小テストの満点合計' },
+      { key: 'regularMaxT', label: '平常点 態度 満点', unit: '点', desc: '平常点(態度)の小テストの満点合計' }
+    ];
+
+    const FORMULA_FACTORS_EXPECTED = [
+      { key: 'rawScore', label: '素点', unit: '点', desc: '入力されたその試験の素点' },
+      { key: 'rate', label: '認定率', unit: '係数', desc: '受験欄の認定率(欠席区分ごとの値)' },
+      { key: 'otherExamAvgPct', label: '他試験の平均得点率', unit: '%', desc: '同観点の他試験の平均得点率' },
+      { key: 'otherExamScore', label: '同期他試験の得点', unit: '点', desc: '同期の他試験における同観点の得点(出席分のみ)' },
+      { key: 'thisExamClassAvg', label: '当試験のクラス平均', unit: '点', desc: '当試験・同観点・同クラスの平均(出席者の素点)' },
+      { key: 'otherExamClassAvg', label: '同期他試験のクラス平均', unit: '点', desc: '同期他試験・同観点・同クラスの平均(出席者の素点)' },
+      { key: 'regularMaxK', label: '平常点 知識 満点', unit: '点', desc: '平常点(知識)の小テストの満点合計' },
+      { key: 'regularMaxS', label: '平常点 思考 満点', unit: '点', desc: '平常点(思考)の小テストの満点合計' },
+      { key: 'regularMaxT', label: '平常点 態度 満点', unit: '点', desc: '平常点(態度)の小テストの満点合計' }
+    ];
+
+    const FORMULA_OPS = [{ key: '+', label: '+' }, { key: '-', label: '−' }, { key: '*', label: '×' }, { key: '/', label: '÷' }];
+    const getOpLabel = (op) => FORMULA_OPS.find(o => o.key === op)?.label ?? op;
+    const getOpPriority = (op) => (op === '+' || op === '-') ? 1 : 2;
+    const getFactorLabel = (factors, key) => factors.find(f => f.key === key)?.label ?? key;
+
+    const DEPTH_COLORS = [
+      { border: 'border-emerald-300', bg: 'bg-emerald-50/70', bar: 'bg-emerald-500', text: 'text-emerald-700' },
+      { border: 'border-amber-300', bg: 'bg-amber-50/70', bar: 'bg-amber-500', text: 'text-amber-700' },
+      { border: 'border-rose-300', bg: 'bg-rose-50/70', bar: 'bg-rose-500', text: 'text-rose-700' },
+      { border: 'border-teal-300', bg: 'bg-teal-50/70', bar: 'bg-teal-500', text: 'text-teal-700' },
+      { border: 'border-lime-300', bg: 'bg-lime-50/70', bar: 'bg-lime-500', text: 'text-lime-700' },
+      { border: 'border-orange-300', bg: 'bg-orange-50/70', bar: 'bg-orange-500', text: 'text-orange-700' }
+    ];
+    const getDepthColor = (depth) => DEPTH_COLORS[depth % DEPTH_COLORS.length];
+
+    const modifyFormulaNode = (node, targetId, modifier) => {
+      if (node.id === targetId) return modifier(node);
+      if (node.kind === 'op') {
+        const left = modifyFormulaNode(node.left, targetId, modifier);
+        const right = modifyFormulaNode(node.right, targetId, modifier);
+        return (left === node.left && right === node.right) ? node : { ...node, left, right };
+      }
+      if (node.kind === 'group') {
+        const child = modifyFormulaNode(node.child, targetId, modifier);
+        return child === node.child ? node : { ...node, child };
+      }
+      return node;
+    };
+
+    const removeFormulaNode = (node, targetId) => {
+      if (node.id === targetId) return createNumberNode(0);
+      if (node.kind === 'group') {
+        const child = removeFormulaNode(node.child, targetId);
+        return child === node.child ? node : { ...node, child };
+      }
+      if (node.kind !== 'op') return node;
+      if (node.left.id === targetId) return node.right;
+      if (node.right.id === targetId) return node.left;
+      const left = removeFormulaNode(node.left, targetId);
+      const right = removeFormulaNode(node.right, targetId);
+      return (left === node.left && right === node.right) ? node : { ...node, left, right };
+    };
+
+    const FormulaDisplay = ({ node, factors, depth, parentOp, isRight }) => {
+      const color = getDepthColor(depth);
+      if (node.kind === 'factor') return <span className={color.text}>{getFactorLabel(factors, node.factor)}</span>;
+      if (node.kind === 'number') return <span className={color.text}>{round3(node.value)}</span>;
+      if (node.kind === 'group') return <span className={color.text}>(<FormulaDisplay node={node.child} factors={factors} depth={depth + 1} parentOp={null} isRight={false} />)</span>;
+      if (node.kind === 'op') {
+        const needsParen = parentOp ? (getOpPriority(node.op) < getOpPriority(parentOp) || (isRight && getOpPriority(node.op) === getOpPriority(parentOp) && (parentOp === '-' || parentOp === '/'))) : false;
+        const content = (
+          <Fragment>
+            <FormulaDisplay node={node.left} factors={factors} depth={depth + 1} parentOp={node.op} isRight={false} />
+            {' '}<span className={`${color.text} font-semibold`}>{getOpLabel(node.op)}</span>{' '}
+            <FormulaDisplay node={node.right} factors={factors} depth={depth + 1} parentOp={node.op} isRight={true} />
+          </Fragment>
+        );
+        return needsParen ? <span className={color.text}>({content})</span> : <Fragment>{content}</Fragment>;
+      }
+    };
+
+    const ActionBtnClass = "inline-flex items-center gap-1 px-1.5 py-0.5 text-[11px] font-medium rounded-md border whitespace-nowrap cursor-pointer transition";
+    const FormulaNodeEditor = ({ node, factors, actions, depth }) => {
+      const color = getDepthColor(depth);
+      if (node.kind === 'factor' || node.kind === 'number') {
+        const val = node.kind === 'number' ? '__number__' : node.factor;
+        return (
+          <div className="inline-flex flex-col gap-1 items-start">
+            <div className="inline-flex items-stretch gap-1.5 w-fit">
+              <span className={`w-1 rounded-full ${color.bar}`}></span>
+              <select className={`${InputClass} !w-52`} value={val} onChange={e => e.target.value === '__number__' ? actions.setNumber(node.id, 1) : actions.setFactor(node.id, e.target.value)}>
+                {factors.map(f => <option key={f.key} value={f.key} title={f.desc}>{f.label} ({f.unit})</option>)}
+                <option value="__number__">数値(定数)</option>
+              </select>
+              {node.kind === 'number' && <input type="number" step="0.1" className={`${InputClass} !w-24`} value={node.value} onChange={e => actions.setNumber(node.id, Number(e.target.value))} />}
+            </div>
+            <div className="flex items-center gap-1 flex-wrap">
+              <button onClick={() => actions.add(node.id)} className={`${ActionBtnClass} border-slate-200 bg-white text-slate-500 hover:border-emerald-400 hover:text-emerald-600`} title="演算を追加"><i className="ri-add-line"></i>演算を追加</button>
+              <button onClick={() => actions.group(node.id)} className={`${ActionBtnClass} border-slate-200 bg-white text-slate-500 hover:border-amber-400 hover:text-amber-600`} title="括弧で囲む"><i className="ri-parentheses-line"></i>括弧で囲む</button>
+              <button onClick={() => actions.remove(node.id)} className={`${ActionBtnClass} border-slate-200 bg-white text-slate-500 hover:border-rose-400 hover:text-rose-600`} title="削除"><i className="ri-delete-bin-line"></i>削除</button>
+            </div>
+          </div>
+        );
+      }
+      if (node.kind === 'group') {
+        return (
+          <div className="inline-flex flex-col gap-1 items-start">
+            <div className={`inline-flex items-center gap-2 rounded-lg border-2 ${color.border} ${color.bg} px-2.5 py-2`}>
+              <span className={`${color.text} font-bold text-lg leading-none select-none`}>(</span>
+              <FormulaNodeEditor node={node.child} factors={factors} actions={actions} depth={depth + 1} />
+              <span className={`${color.text} font-bold text-lg leading-none select-none`}>)</span>
+            </div>
+            <div className="flex items-center gap-1 flex-wrap">
+              <button onClick={() => actions.ungroup(node.id)} className={`${ActionBtnClass} border-slate-200 bg-white text-slate-500 hover:border-amber-400 hover:text-amber-600`} title="括弧を外す"><i className="ri-parentheses-line"></i>括弧を外す</button>
+              <button onClick={() => actions.remove(node.id)} className={`${ActionBtnClass} border-slate-200 bg-white text-slate-500 hover:border-rose-400 hover:text-rose-600`} title="削除"><i className="ri-delete-bin-line"></i>削除</button>
+            </div>
+          </div>
+        );
+      }
+      return (
+        <div className="inline-flex flex-col gap-1 items-start">
+          <div className={`inline-flex items-center gap-2 flex-wrap rounded-lg border-2 ${color.border} ${color.bg} px-2.5 py-2`}>
+            <FormulaNodeEditor node={node.left} factors={factors} actions={actions} depth={depth + 1} />
+            <select className={`${InputClass} !w-14 text-center font-bold ${color.text} !border-2 ${color.border} !bg-white`} value={node.op} onChange={e => actions.setOp(node.id, e.target.value)} title="演算子">
+              {FORMULA_OPS.map(o => <option key={o.key} value={o.key}>{o.label}</option>)}
+            </select>
+            <FormulaNodeEditor node={node.right} factors={factors} actions={actions} depth={depth + 1} />
+          </div>
+          <div className="flex items-center gap-1 flex-wrap">
+            <button onClick={() => actions.group(node.id)} className={`${ActionBtnClass} border-slate-200 bg-white text-slate-500 hover:border-amber-400 hover:text-amber-600`} title="括弧で囲む"><i className="ri-parentheses-line"></i>括弧で囲む</button>
+            <button onClick={() => actions.remove(node.id)} className={`${ActionBtnClass} border-slate-200 bg-white text-slate-500 hover:border-rose-400 hover:text-rose-600`} title="削除"><i className="ri-delete-bin-line"></i>削除</button>
+          </div>
+        </div>
+      );
+    };
+
+    const FormulaEditor = ({ title, icon, desc, prefix, factors, formula, onChange }) => {
+      const update = (updater) => onChange(updater(formula));
+      const actions = {
+        setFactor: (id, val) => update(f => modifyFormulaNode(f, id, n => n.kind === 'factor' ? { ...n, factor: val } : createFactorNode(val))),
+        setNumber: (id, val) => update(f => modifyFormulaNode(f, id, n => n.kind === 'number' ? { ...n, value: val } : createNumberNode(val))),
+        setOp: (id, val) => update(f => modifyFormulaNode(f, id, n => ({ ...n, op: val }))),
+        add: (id) => update(f => modifyFormulaNode(f, id, n => createOpNode('+', n, createNumberNode(1)))),
+        group: (id) => update(f => modifyFormulaNode(f, id, n => createGroupNode(n))),
+        ungroup: (id) => update(f => modifyFormulaNode(f, id, n => n.kind === 'group' ? n.child : n)),
+        remove: (id) => update(f => removeFormulaNode(f, id))
+      };
+      return (
+        <Section title={title} icon={icon} desc={desc}>
+          <div className="bg-slate-50 border border-slate-200 rounded-md px-3 py-2.5 mb-4">
+            <span className="text-[11px] text-slate-400 block mb-1">{prefix}</span>
+            <span className="font-mono text-sm text-slate-700 break-words leading-relaxed">
+              <FormulaDisplay node={formula} factors={factors} depth={0} parentOp={null} isRight={false} />
+            </span>
+          </div>
+          <div className="flex items-center gap-3 flex-wrap text-[11px] text-slate-500 mb-3">
+            <span className="inline-flex items-center gap-1"><i className="ri-add-line text-emerald-500"></i>演算を追加</span>
+            <span className="inline-flex items-center gap-1"><i className="ri-parentheses-line text-amber-500"></i>括弧で囲む(グループ化)</span>
+            <span className="inline-flex items-center gap-1"><i className="ri-delete-bin-line text-rose-500"></i>削除</span>
+            <span className="inline-flex items-center gap-1 text-slate-400">
+              <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
+              <span className="w-2 h-2 rounded-full bg-amber-500"></span>
+              <span className="w-2 h-2 rounded-full bg-rose-500"></span>
+              同じ色＝同じ階層。プレビューと編集の色は対応します
+            </span>
+          </div>
+          <FormulaNodeEditor node={formula} factors={factors} actions={actions} depth={0} />
+        </Section>
+      );
+    };
+
+    // --- フィルタリングコンポーネント ---
+    const FilterPopover = ({ label, active, onClear, children }) => {
+      const [isOpen, setIsOpen] = useState(false);
+      const [pos, setPos] = useState({ top: 0, left: 0 });
+      const btnRef = useRef(null);
+      const popRef = useRef(null);
+
+      useEffect(() => {
+        if (!isOpen) return;
+        const handleClick = (e) => { if (!popRef.current?.contains(e.target) && !btnRef.current?.contains(e.target)) setIsOpen(false); };
+        const handleKey = (e) => { if (e.key === 'Escape') setIsOpen(false); };
+        const handleScroll = () => setIsOpen(false);
+        document.addEventListener('mousedown', handleClick);
+        document.addEventListener('keydown', handleKey);
+        window.addEventListener('scroll', handleScroll, true);
+        return () => { document.removeEventListener('mousedown', handleClick); document.removeEventListener('keydown', handleKey); window.removeEventListener('scroll', handleScroll, true); };
+      }, [isOpen]);
+
+      return (
+        <Fragment>
+          <button ref={btnRef} type="button" onMouseDown={e => e.stopPropagation()} onClick={() => { if (!isOpen && btnRef.current) { const rect = btnRef.current.getBoundingClientRect(); let left = rect.left; if (left + 240 > window.innerWidth - 8) left = Math.max(8, window.innerWidth - 240 - 8); setPos({ top: rect.bottom + 4, left }); } setIsOpen(!isOpen); }} title={`${label}で絞り込み`} className={`inline-flex items-center justify-center w-5 h-5 rounded ml-1 shrink-0 cursor-pointer transition ${active || isOpen ? 'text-emerald-600 bg-emerald-100' : 'text-slate-400 hover:text-emerald-600 hover:bg-emerald-50'}`}><i className="ri-filter-3-line text-xs"></i></button>
+          {isOpen && (
+            <div ref={popRef} onMouseDown={e => e.stopPropagation()} style={{ position: 'fixed', top: pos.top, left: pos.left, zIndex: 60 }} className="w-60 rounded-lg border border-slate-200 bg-white shadow-lg">
+              <div className="flex items-center justify-between gap-2 px-3 py-2 border-b border-slate-100">
+                <span className="text-xs font-semibold text-slate-700 truncate">{label}</span>
+                <button type="button" onClick={onClear} className="text-[11px] text-slate-500 hover:text-emerald-600 cursor-pointer whitespace-nowrap shrink-0">クリア</button>
+              </div>
+              <div className="p-2">{children}</div>
+            </div>
+          )}
+        </Fragment>
+      );
+    };
+
+    const CheckboxFilter = ({ options, selected, onToggle }) => (
+      <div className="space-y-0.5 max-h-56 overflow-y-auto">
+        {options.map(opt => (
+          <label key={opt.value} className="flex items-center gap-2 px-2 py-1.5 rounded-md hover:bg-slate-50 cursor-pointer">
+            <input type="checkbox" checked={selected.includes(opt.value)} onChange={() => onToggle(opt.value)} className="w-3.5 h-3.5 accent-emerald-600 cursor-pointer" />
+            <span className="text-xs text-slate-700 whitespace-nowrap">{opt.label}</span>
+          </label>
+        ))}
+      </div>
+    );
+
+    const RangeFilter = ({ min, max, onMin, onMax }) => {
+      const cls = "w-full text-xs border border-slate-300 rounded-md px-1.5 py-1 focus:outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100";
+      return (
+        <div className="space-y-2">
+          <div className="flex items-center gap-2"><span className="text-[11px] text-slate-500 w-6 shrink-0">下限</span><input type="number" inputMode="decimal" value={min} onChange={e => onMin(e.target.value)} placeholder="–" className={cls} /></div>
+          <div className="flex items-center gap-2"><span className="text-[11px] text-slate-500 w-6 shrink-0">上限</span><input type="number" inputMode="decimal" value={max} onChange={e => onMax(e.target.value)} placeholder="–" className={cls} /></div>
+        </div>
+      );
+    };
+
+    // --- 設定タブ ---
+    const SettingsTab = ({ state, setState }) => {
+      const update = updateState(setState);
+      return (
+        <div>
+          <Section title="はじめに: 学期と観点別の割合" icon="ri-calendar-line" desc="学期ごとに「試験:平常点」の割合(%)と態度の初期付与点・換算係数を設定します"
+            action={<button onClick={() => update(s => { s.settings.terms.push({ id: generateId('term'), name: `学期${s.settings.terms.length + 1}`, weights: { k: { exam: 0.5, regular: 0.5 }, s: { exam: 0.5, regular: 0.5 }, t: { exam: 0.3, regular: 0.7 } }, attitudeInitial: 30, attitudeCoef: 0.3 }); })} className={`${ButtonClass} bg-emerald-500 text-white hover:bg-emerald-600`}><i className="ri-add-line"></i>学期を追加</button>}>
+            <div className="space-y-5">
+              {state.settings.terms.map((term, i) => (
+                <div key={term.id} className="border border-slate-200 rounded-lg p-4 bg-slate-50/50">
+                  <div className="flex items-center gap-3 mb-3 flex-wrap">
+                    <input className={`${InputClass} !w-40 font-semibold`} value={term.name} onChange={e => update(s => { s.settings.terms[i].name = e.target.value; })} />
+                    <button onClick={() => update(s => { if (s.settings.terms.length > 1) s.settings.terms.splice(i, 1); })} disabled={state.settings.terms.length <= 1} className="ml-auto w-8 h-8 flex items-center justify-center text-slate-400 hover:text-rose-500 disabled:opacity-30 cursor-pointer"><i className="ri-delete-bin-line"></i></button>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="min-w-full text-sm bg-white rounded-md">
+                      <thead>
+                        <tr className="text-[11px] text-slate-500 bg-slate-100">
+                          <th className="px-2 py-1.5 text-left font-medium">観点</th>
+                          <th className="px-2 py-1.5 font-medium">試験の割合(%)</th>
+                          <th className="px-2 py-1.5 font-medium">平常点の割合(%)</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {[{ key: 'k', label: '知識' }, { key: 's', label: '思考' }].map(vp => (
+                          <tr key={vp.key} className="border-t border-slate-100">
+                            <td className="px-2 py-1.5 font-medium text-slate-700">{vp.label}</td>
+                            <td className="px-2 py-1.5 text-center">
+                              <div className="flex items-center justify-center gap-1">
+                                <input type="number" step="0.1" className={`${InputClass} !w-20`} value={round1(term.weights[vp.key].exam * 100)} onChange={e => update(s => { s.settings.terms[i].weights[vp.key].exam = Number(e.target.value) / 100; })} />
+                                <span className="text-xs text-slate-500">%</span>
+                              </div>
+                            </td>
+                            <td className="px-2 py-1.5 text-center">
+                              <div className="flex items-center justify-center gap-1">
+                                <input type="number" step="0.1" className={`${InputClass} !w-20`} value={round1(term.weights[vp.key].regular * 100)} onChange={e => update(s => { s.settings.terms[i].weights[vp.key].regular = Number(e.target.value) / 100; })} />
+                                <span className="text-xs text-slate-500">%</span>
+                              </div>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div className="mt-4 pt-3 border-t border-slate-200">
+                    <div className="flex items-center gap-2 text-xs text-slate-600 mb-2"><i className="ri-function-line"></i><span>態度の算出設定（初期付与点・換算係数は学期ごと）</span></div>
+                    <div className="flex items-center gap-4 flex-wrap">
+                      <label className="flex items-center gap-1.5 text-xs text-slate-600">初期付与点<input type="number" step="0.1" className={`${InputClass} !w-20`} value={term.attitudeInitial} onChange={e => update(s => { s.settings.terms[i].attitudeInitial = Number(e.target.value); })} /></label>
+                      <label className="flex items-center gap-1.5 text-xs text-slate-600">換算係数<input type="number" step="0.01" className={`${InputClass} !w-20`} value={term.attitudeCoef} onChange={e => update(s => { s.settings.terms[i].attitudeCoef = Number(e.target.value); })} /></label>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </Section>
+
+          <Section title="試験と観点別内訳(満点)" icon="ri-file-list-3-line" desc="各試験の知識・思考・態度の満点を設定します(合計100になるのが目安)"
+            action={<button onClick={() => update(s => { s.settings.exams.push({ id: generateId('exam'), termId: s.settings.terms[0]?.id ?? '', name: '新規テスト', maxK: 60, maxS: 40, maxT: 0 }); })} className={`${ButtonClass} bg-emerald-500 text-white hover:bg-emerald-600`}><i className="ri-add-line"></i>試験を追加</button>}>
+            <div className="overflow-x-auto">
+              <table className="min-w-full text-sm">
+                <thead>
+                  <tr className="text-[11px] text-slate-500 bg-slate-50">
+                    <th className="px-2 py-2 text-left font-medium">学期</th>
+                    <th className="px-2 py-2 text-left font-medium min-w-[140px]">試験名</th>
+                    <th className="px-2 py-2 font-medium">知識満点</th>
+                    <th className="px-2 py-2 font-medium">思考満点</th>
+                    <th className="px-2 py-2 font-medium">態度満点</th>
+                    <th className="px-2 py-2 font-medium">合計</th>
+                    <th className="px-2 py-2 w-10"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {state.settings.exams.map((exam, i) => (
+                    <tr key={exam.id} className="border-t border-slate-100">
+                      <td className="px-2 py-1.5">
+                        <select className={`${InputClass} !w-28`} value={exam.termId} onChange={e => update(s => { s.settings.exams[i].termId = e.target.value; })}>
+                          {state.settings.terms.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+                        </select>
+                      </td>
+                      <td className="px-2 py-1.5"><input className={InputClass} value={exam.name} onChange={e => update(s => { s.settings.exams[i].name = e.target.value; })} /></td>
+                      {['maxK', 'maxS', 'maxT'].map(vp => (
+                        <td key={vp} className="px-2 py-1.5 text-center"><input type="number" className={`${InputClass} !w-20 !mx-auto`} value={exam[vp]} onChange={e => update(s => { s.settings.exams[i][vp] = Number(e.target.value); })} /></td>
+                      ))}
+                      <td className="px-2 py-1.5 text-center text-slate-500">{exam.maxK + exam.maxS + exam.maxT}</td>
+                      <td className="px-2 py-1.5"><button onClick={() => update(s => { const [removed] = s.settings.exams.splice(i, 1); if (removed) Object.keys(s.examScores).forEach(stuId => { delete s.examScores[stuId][removed.id]; }); })} className="w-8 h-8 flex items-center justify-center text-slate-400 hover:text-rose-500 cursor-pointer"><i className="ri-delete-bin-line"></i></button></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </Section>
+
+          <FormulaEditor title="態度点の計算式" icon="ri-function-line" desc="態度点をどう算出するか、＋−×÷の四則演算を自由に組み合わせて編集できます。「初期付与点」「換算係数」は学期ごとの値が使われます" prefix="態度点 =" factors={FORMULA_FACTORS_ATTITUDE} formula={state.settings.attitudeFormula} onChange={f => update(s => { s.settings.attitudeFormula = f; })} />
+          <FormulaEditor title="見込み点の計算式(受験の認定得点)" icon="ri-eye-line" desc="受験(欠席含む)の観点別得点をどう認定するか。デフォルトは「素点 × 認定率」。四則演算を自由に組んで、クラス平均や他試験から推定する式にも変更できます" prefix="認定得点 =" factors={FORMULA_FACTORS_EXPECTED} formula={state.settings.expectedFormula} onChange={f => update(s => { s.settings.expectedFormula = f; })} />
+
+          <div className="grid lg:grid-cols-2 gap-5">
+            <Section title="出席区分と点数認定率" icon="ri-user-unfollow-line" desc="欠席=1.0、遅刻=0.3 のように、受験状況ごとの得点認定率を設定します"
+              action={<button onClick={() => update(s => { s.settings.absences.push({ id: generateId('abs'), name: '新規', rate: 1 }); })} className={`${ButtonClass} bg-slate-100 text-slate-700 hover:bg-slate-200`}><i className="ri-add-line"></i>追加</button>}>
+              <div className="space-y-2">
+                {state.settings.absences.map((abs, i) => (
+                  <div key={abs.id} className="grid grid-cols-[1fr_120px_36px] gap-2 items-center bg-slate-50 rounded-md p-2">
+                    <input className={InputClass} value={abs.name} onChange={e => update(s => { s.settings.absences[i].name = e.target.value; })} />
+                    <input type="number" step="0.1" className={InputClass} value={abs.rate} onChange={e => update(s => { s.settings.absences[i].rate = Number(e.target.value); })} />
+                    <button onClick={() => update(s => { s.settings.absences.splice(i, 1); })} className="w-8 h-8 flex items-center justify-center text-slate-400 hover:text-rose-500 cursor-pointer"><i className="ri-delete-bin-line"></i></button>
+                  </div>
+                ))}
+              </div>
+            </Section>
+            <Section title="評点上限(点法)" icon="ri-stack-line" desc="観点得点を何点満点で扱うかを決めます">
+              <label className="block text-sm"><span className="text-slate-600">評点上限</span><input type="number" className={`${InputClass} mt-1 !w-32`} value={state.settings.maxScore} onChange={e => update(s => { s.settings.maxScore = Number(e.target.value); })} /></label>
+              <p className="text-[11px] text-slate-400 mt-3">例: 100点法なら100。観点の「割合」はこの満点に対する比率で判定されます</p>
+            </Section>
+          </div>
+
+          <div className="grid lg:grid-cols-2 gap-5">
+            <Section title="観点の評価基準" icon="ri-medal-line" desc="割合(以上)と換算値・ラベルを自由に変更できます(例: 5/4/3/2/1 や 秀/優/良/可)"
+              action={<button onClick={() => update(s => { s.settings.gradeScale.push({ id: generateId('gs'), label: '新', minRatio: 0, value: 1, tone: 'slate' }); })} className={`${ButtonClass} bg-slate-100 text-slate-700 hover:bg-slate-200`}><i className="ri-add-line"></i>追加</button>}>
+              <div className="grid grid-cols-[1fr_1fr_1fr_1fr_36px] gap-2 px-2 mb-1 text-[11px] font-medium text-slate-500"><span>ラベル</span><span>割合(以上)</span><span>換算値</span><span>カラー</span><span></span></div>
+              <div className="space-y-2">
+                {state.settings.gradeScale.map((gs, i) => (
+                  <div key={gs.id} className="grid grid-cols-[1fr_1fr_1fr_1fr_36px] gap-2 items-center bg-slate-50 rounded-md p-2">
+                    <input className={InputClass} value={gs.label} placeholder="ラベル" onChange={e => update(s => { s.settings.gradeScale[i].label = e.target.value; })} />
+                    <input type="number" step="0.01" className={InputClass} value={gs.minRatio} title="下限割合(以上)" onChange={e => update(s => { s.settings.gradeScale[i].minRatio = Number(e.target.value); })} />
+                    <input type="number" className={InputClass} value={gs.value} title="換算値" onChange={e => update(s => { s.settings.gradeScale[i].value = Number(e.target.value); })} />
+                    <select className={InputClass} value={gs.tone} onChange={e => update(s => { s.settings.gradeScale[i].tone = e.target.value; })}>
+                      {['emerald', 'teal', 'lime', 'amber', 'orange', 'rose', 'slate'].map(t => <option key={t} value={t}>{t}</option>)}
+                    </select>
+                    <button onClick={() => update(s => { s.settings.gradeScale.splice(i, 1); })} className="w-8 h-8 flex items-center justify-center text-slate-400 hover:text-rose-500 cursor-pointer"><i className="ri-delete-bin-line"></i></button>
+                  </div>
+                ))}
+              </div>
+              <p className="text-[11px] text-slate-400 mt-3">※ 割合は大きい順に判定されます</p>
+            </Section>
+            <Section title="評定基準(換算値の合計)" icon="ri-award-line" desc="3観点の換算値合計がどの範囲ならどの評定か、を設定します"
+              action={<button onClick={() => update(s => { s.settings.finalScale.push({ id: generateId('fs'), label: '新', minSum: 0, maxSum: 0 }); })} className={`${ButtonClass} bg-slate-100 text-slate-700 hover:bg-slate-200`}><i className="ri-add-line"></i>追加</button>}>
+              <div className="grid grid-cols-[1fr_1fr_1fr_36px] gap-2 px-2 mb-1 text-[11px] font-medium text-slate-500"><span>評定</span><span>合計の下限</span><span>合計の上限</span><span></span></div>
+              <div className="space-y-2">
+                {state.settings.finalScale.map((fs, i) => (
+                  <div key={fs.id} className="grid grid-cols-[1fr_1fr_1fr_36px] gap-2 items-center bg-slate-50 rounded-md p-2">
+                    <input className={InputClass} value={fs.label} placeholder="評定" onChange={e => update(s => { s.settings.finalScale[i].label = e.target.value; })} />
+                    <input type="number" className={InputClass} value={fs.minSum} title="合計の下限" onChange={e => update(s => { s.settings.finalScale[i].minSum = Number(e.target.value); })} />
+                    <input type="number" className={InputClass} value={fs.maxSum} title="合計の上限" onChange={e => update(s => { s.settings.finalScale[i].maxSum = Number(e.target.value); })} />
+                    <button onClick={() => update(s => { s.settings.finalScale.splice(i, 1); })} className="w-8 h-8 flex items-center justify-center text-slate-400 hover:text-rose-500 cursor-pointer"><i className="ri-delete-bin-line"></i></button>
+                  </div>
+                ))}
+              </div>
+              <p className="text-[11px] text-slate-400 mt-3">※ 換算値の合計が範囲内の評定が付きます</p>
+            </Section>
+          </div>
+        </div>
+      );
+    };
+
+    // --- 得点入力タブ ---
+    const InputTab = ({ state, setState, showToast }) => {
+      const update = updateState(setState);
+      const [activeTermId, setActiveTermId] = useState(state.settings.terms[0]?.id ?? '');
+      const [columns, setColumns] = useState(['no', 'cls', 'course', 'name']);
+      const [filters, setFilters] = useState({ cls: [], course: [], name: '' });
+      const dragRef = useRef(null);
+
+      const term = state.settings.terms.find(t => t.id === activeTermId) ?? state.settings.terms[0];
+      const exams = useMemo(() => state.settings.exams.filter(e => e.termId === term?.id), [state.settings.exams, term?.id]);
+      const regularItems = useMemo(() => state.settings.regularItems.filter(e => e.termId === term?.id), [state.settings.regularItems, term?.id]);
+      const pasteColumns = useMemo(() => [
+        { type: 'no' }, { type: 'cls' }, { type: 'course' }, { type: 'name' },
+        ...exams.flatMap(e => [{ type: 'exam', examId: e.id, vp: 'k' }, { type: 'exam', examId: e.id, vp: 's' }]),
+        ...regularItems.map(e => ({ type: 'regular', itemId: e.id }))
+      ], [exams, regularItems]);
+
+      const statuses = useMemo(() => [{ id: 'attend', name: '受験', rate: 1 }, ...state.settings.absences.map(a => ({ id: a.id, name: a.name, rate: a.rate })), { id: 'transfer', name: '転出', rate: 0 }], [state.settings.absences]);
+
+      const classes = useMemo(() => [...new Set(state.students.map(s => s.cls))].filter(Boolean).sort(), [state.students]);
+      const courses = useMemo(() => [...new Set(state.students.map(s => s.course).filter(Boolean))].sort(), [state.students]);
+
+      const filteredStudents = useMemo(() => {
+        return state.students.filter(stu => {
+          if (filters.cls.length > 0 && !filters.cls.includes(stu.cls)) return false;
+          if (filters.course.length > 0 && !filters.course.includes(stu.course)) return false;
+          if (filters.name.trim() !== '' && !stu.name.toLowerCase().includes(filters.name.toLowerCase())) return false;
+          return true;
+        });
+      }, [state.students, filters]);
+
+      const examAvgs = useMemo(() => {
+        const avgs = {};
+        exams.forEach(ex => {
+          const sums = { k: 0, s: 0, t: 0, total: 0 }, counts = { k: 0, s: 0, t: 0, total: 0 };
+          filteredStudents.forEach(stu => {
+            if (isTransferred(state, stu.id)) return;
+            const score = state.examScores[stu.id]?.[ex.id];
+            if (!score) return;
+            ['k', 's', 't'].forEach(vp => {
+              if (typeof score[vp] === 'number') { sums[vp] += score[vp]; counts[vp] += 1; }
+            });
+            const validScores = [score.k, score.s, score.t].filter(v => typeof v === 'number');
+            if (validScores.length) { sums.total += validScores.reduce((a, b) => a + b, 0); counts.total += 1; }
+          });
+          avgs[ex.id] = {
+            k: counts.k ? sums.k / counts.k : null,
+            s: counts.s ? sums.s / counts.s : null,
+            t: counts.t ? sums.t / counts.t : null,
+            total: counts.total ? sums.total / counts.total : null
+          };
+        });
+        return avgs;
+      }, [state, exams, filteredStudents]);
+
+      const regAvgs = useMemo(() => {
+        const avgs = {};
+        regularItems.forEach(item => {
+          let sum = 0, count = 0;
+          filteredStudents.forEach(stu => {
+            if (isTransferred(state, stu.id)) return;
+            const score = state.regularScores[stu.id]?.[item.id];
+            if (typeof score === 'number') { sum += score; count += 1; }
+          });
+          avgs[item.id] = count ? sum / count : null;
+        });
+        return avgs;
+      }, [state, regularItems, filteredStudents]);
+
+      const handlePaste = (e, filteredIdx, colIndex) => {
+        const text = e.clipboardData.getData('text');
+        if (!text) return;
+        const lines = text.split(/\r?\n/).filter(l => l.trim() !== '');
+        if (!lines.length) return;
+        const separator = lines[0].includes('\t') ? '\t' : lines[0].includes(',') ? ',' : '\t';
+        const data = lines.map(l => l.split(separator));
+        e.preventDefault();
+        const addedCount = Math.max(0, filteredIdx + data.length - filteredStudents.length);
+
+        update(draft => {
+          let currentFilteredIdx = filteredIdx;
+          data.forEach(row => {
+            const targetStuId = filteredStudents[currentFilteredIdx]?.id;
+            let stu;
+            if (targetStuId) {
+              stu = draft.students.find(s => s.id === targetStuId);
+            } else {
+              const lastStu = draft.students[draft.students.length - 1];
+              stu = { id: generateId('stu'), no: (lastStu?.no ?? 0) + 1, cls: '', course: '', name: '' };
+              draft.students.push(stu);
+            }
+
+            row.forEach((val, i) => {
+              const colDef = pasteColumns[colIndex + i];
+              if (colDef) {
+                const v = val.trim();
+                const num = Number(v);
+                const isNum = Number.isFinite(num) && v !== '';
+                switch (colDef.type) {
+                  case 'no': if (isNum) stu.no = parseInt(v, 10); break;
+                  case 'cls': stu.cls = v; break;
+                  case 'course': stu.course = v; break;
+                  case 'name': stu.name = v; break;
+                  case 'exam': {
+                    draft.examScores[stu.id] ??= {};
+                    draft.examScores[stu.id][colDef.examId] ??= { status: 'attend', rate: 1, k: null, s: null, t: null };
+                    draft.examScores[stu.id][colDef.examId][colDef.vp] = isNum ? num : null;
+                    break;
+                  }
+                  case 'regular': {
+                    draft.regularScores[stu.id] ??= {};
+                    draft.regularScores[stu.id][colDef.itemId] = isNum ? num : null;
+                    break;
+                  }
+                }
+              }
+            });
+            currentFilteredIdx++;
+          });
+        });
+        showToast(addedCount > 0 ? `${addedCount}名を追加して貼り付けました` : '貼り付けました');
+      };
+
+      const handleDragStart = (col, e) => { dragRef.current = col; e.dataTransfer.effectAllowed = 'move'; try { e.dataTransfer.setData('text/plain', col); } catch {} };
+      const handleDrop = (col) => {
+        const draggedCol = dragRef.current;
+        dragRef.current = null;
+        if (draggedCol && draggedCol !== col) {
+          setColumns(prev => {
+            const next = [...prev];
+            next[next.indexOf(draggedCol)] = col;
+            next[next.indexOf(col)] = draggedCol;
+            return next;
+          });
+        }
+      };
+
+      if (!term) return null;
+
+      return (
+        <div>
+          <div className="flex items-center gap-2 mb-4 flex-wrap">
+            <span className="text-xs text-slate-500 mr-1"><i className="ri-filter-3-line mr-1"></i>学期:</span>
+            {state.settings.terms.map(t => (
+              <button key={t.id} onClick={() => setActiveTermId(t.id)} className={`px-3 py-1.5 text-xs rounded-full whitespace-nowrap cursor-pointer transition border ${t.id === term.id ? 'bg-emerald-500 text-white border-emerald-500' : 'bg-white text-slate-600 border-slate-200 hover:border-emerald-300 hover:text-emerald-700'}`}>{t.name}</button>
+            ))}
+          </div>
+          <Section title={`${term.name} の得点入力`} icon="ri-edit-line" desc="試験の観点別得点と平常点をまとめて入力できます。セルを選んで Ctrl+V でスプレッドシートから一括貼り付けできます。"
+            action={
+              <div className="flex items-center gap-2">
+                <button onClick={() => update(s => { s.settings.regularItems.push({ id: generateId('reg'), termId: term.id, vp: 'k', name: '新しい小テスト', max: 10 }); })} className={`${ButtonClass} bg-slate-100 text-slate-700 hover:bg-slate-200`}><i className="ri-add-line"></i>小テストを追加</button>
+                <button onClick={() => update(s => { const last = s.students[s.students.length - 1]; s.students.push({ id: generateId('stu'), no: (last?.no ?? 0) + 1, cls: last?.cls ?? '1-A', course: last?.course ?? '', name: `新規生徒 ${(last?.no ?? 0) + 1}` }); })} className={`${ButtonClass} bg-emerald-500 text-white hover:bg-emerald-600`}><i className="ri-user-add-line"></i>生徒を追加</button>
+              </div>
+            }>
+            <div className="overflow-auto max-h-[70vh]">
+              <table className="min-w-full text-sm border-separate border-spacing-0">
+                <thead className="sticky top-0 z-10">
+                  <tr className="text-[11px] text-slate-500">
+                    <th rowSpan={3} className="w-10 bg-white border-b border-slate-200"></th>
+                    {columns.map(col => (
+                      <th key={col} rowSpan={3} draggable onDragStart={e => handleDragStart(col, e)} onDragOver={e => e.preventDefault()} onDrop={() => handleDrop(col)} onDragEnd={() => { dragRef.current = null; }} className={`px-2 py-1.5 text-left font-medium align-bottom bg-white border-b border-slate-200 cursor-grab active:cursor-grabbing select-none ${col === 'name' ? 'min-w-[120px]' : ''}`} title="ドラッグで列を並び替え">
+                        <div className="flex items-center">
+                          <span className="inline-flex items-center gap-1.5 whitespace-nowrap"><i className="ri-draggable text-slate-300"></i>{COL_LABELS[col]}</span>
+                          {col === 'cls' && (
+                            <FilterPopover label="クラス" active={filters.cls.length > 0} onClear={() => setFilters(p => ({ ...p, cls: [] }))}>
+                              <CheckboxFilter options={classes.map(c => ({ value: c, label: c }))} selected={filters.cls} onToggle={v => setFilters(p => ({ ...p, cls: p.cls.includes(v) ? p.cls.filter(x => x !== v) : [...p.cls, v] }))} />
+                            </FilterPopover>
+                          )}
+                          {col === 'course' && (
+                            <FilterPopover label="コース" active={filters.course.length > 0} onClear={() => setFilters(p => ({ ...p, course: [] }))}>
+                              <CheckboxFilter options={courses.map(c => ({ value: c, label: c }))} selected={filters.course} onToggle={v => setFilters(p => ({ ...p, course: p.course.includes(v) ? p.course.filter(x => x !== v) : [...p.course, v] }))} />
+                            </FilterPopover>
+                          )}
+                          {col === 'name' && (
+                            <FilterPopover label="氏名" active={filters.name !== ''} onClear={() => setFilters(p => ({ ...p, name: '' }))}>
+                              <div className="p-2">
+                                <input type="text" className="w-full text-xs border border-slate-300 rounded-md px-2 py-1.5 focus:outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100" placeholder="氏名で検索..." value={filters.name} onChange={e => setFilters(p => ({ ...p, name: e.target.value }))} onMouseDown={e => e.stopPropagation()} />
+                              </div>
+                            </FilterPopover>
+                          )}
+                        </div>
+                      </th>
+                    ))}
+                    {exams.map(ex => <th key={ex.id} colSpan={6} className="px-2 py-1.5 text-center font-semibold bg-sky-50 text-sky-700 border-l border-sky-100 border-b border-slate-200">{ex.name}</th>)}
+                    {regularItems.length > 0 && <th colSpan={regularItems.length} className="px-2 py-1.5 text-center font-semibold bg-amber-50 text-amber-700 border-l border-amber-100 border-b border-slate-200">平常点（小テスト）</th>}
+                  </tr>
+                  <tr className="text-[10px]">
+                    {exams.map(ex => (
+                      <Fragment key={ex.id}>
+                        <th rowSpan={2} className="px-1 py-1 bg-sky-50 border-l border-sky-100 border-b border-slate-200 whitespace-nowrap">受験</th>
+                        <th rowSpan={2} className="px-1 py-1 bg-sky-50 border-b border-slate-200 whitespace-nowrap">認定率</th>
+                        {['k', 's', 't', 'total'].map(vp => (
+                          <th key={vp} className="px-1 py-1 bg-emerald-50 border-b border-slate-200">
+                            <span className="block text-[9px] font-normal leading-tight text-emerald-600">平均</span>
+                            <span className="font-semibold text-emerald-800">{examAvgs[ex.id][vp] == null ? '–' : round1(examAvgs[ex.id][vp])}</span>
+                          </th>
+                        ))}
+                      </Fragment>
+                    ))}
+                    {regularItems.map(item => (
+                      <th key={item.id} className="px-1 py-1 bg-amber-50 border-b border-slate-200">
+                        <span className="block text-[9px] font-normal leading-tight text-amber-600">平均</span>
+                        <span className="font-semibold text-amber-800">{regAvgs[item.id] == null ? '–' : round1(regAvgs[item.id])}</span>
+                      </th>
+                    ))}
+                  </tr>
+                  <tr className="text-[10px] text-slate-400">
+                    {exams.map(ex => (
+                      <Fragment key={ex.id}>
+                        <th className="px-1 py-1 bg-sky-50 border-l border-sky-100 border-b border-slate-200 whitespace-nowrap">知識<span className="block text-[9px] font-normal text-sky-500">満点 {ex.maxK}</span></th>
+                        <th className="px-1 py-1 bg-sky-50 border-b border-slate-200 whitespace-nowrap">思考<span className="block text-[9px] font-normal text-sky-500">満点 {ex.maxS}</span></th>
+                        <th className="px-1 py-1 bg-sky-50 border-b border-slate-200 whitespace-nowrap">態度<span className="block text-[9px] font-normal text-sky-500">満点 {ex.maxT}</span></th>
+                        <th className="px-1 py-1 bg-sky-50 border-b border-slate-200 whitespace-nowrap">合計<span className="block text-[9px] font-normal text-sky-500">満点 {ex.maxK + ex.maxS + ex.maxT}</span></th>
+                      </Fragment>
+                    ))}
+                    {regularItems.map(item => (
+                      <th key={item.id} className="px-1 py-1 bg-amber-50 border-l border-amber-100 border-b border-slate-200">
+                        <div className="flex flex-col items-stretch gap-0.5 min-w-[96px]">
+                          <input className="w-full text-[10px] font-medium text-amber-800 bg-white border border-amber-200 rounded px-1 py-0.5 focus:outline-none focus:border-amber-400" value={item.name} onChange={e => update(s => { s.settings.regularItems.find(i => i.id === item.id).name = e.target.value; })} title="小テスト名" />
+                          <div className="flex items-center gap-1">
+                            <select className={`flex-1 text-[10px] rounded px-1 py-0.5 border focus:outline-none ${item.vp === 'k' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : item.vp === 's' ? 'bg-sky-50 text-sky-700 border-sky-200' : 'bg-amber-50 text-amber-700 border-amber-200'}`} value={item.vp} onChange={e => update(s => { s.settings.regularItems.find(i => i.id === item.id).vp = e.target.value; })} title="観点">
+                              {VIEWPOINTS.map(vp => <option key={vp.key} value={vp.key}>{vp.label}</option>)}
+                            </select>
+                            <input type="number" className="w-12 text-[10px] text-center bg-white border border-amber-200 rounded px-1 py-0.5 focus:outline-none focus:border-amber-400" value={item.max} onChange={e => update(s => { s.settings.regularItems.find(i => i.id === item.id).max = Number(e.target.value); })} title="満点" />
+                          </div>
+                          <button onClick={() => update(s => { s.settings.regularItems = s.settings.regularItems.filter(i => i.id !== item.id); Object.keys(s.regularScores).forEach(stuId => delete s.regularScores[stuId][item.id]); })} className="text-[10px] text-slate-400 hover:text-rose-500 cursor-pointer inline-flex items-center justify-center gap-0.5"><i className="ri-delete-bin-line"></i>削除</button>
+                        </div>
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredStudents.length === 0 ? (
+                    <tr><td colSpan={100} className="px-4 py-8 text-center text-slate-400 text-sm">{state.students.length === 0 ? 'まだ生徒がいません。「生徒を追加」から始めましょう。' : '該当する生徒がいません。'}</td></tr>
+                  ) : filteredStudents.map((stu, filteredIdx) => {
+                    const stuIdx = state.students.findIndex(s => s.id === stu.id);
+                    const isTrans = isTransferred(state, stu.id);
+                    const hasName = stu.name.trim() !== '';
+                    const isWarning = !isTrans && hasName && exams.some(ex => {
+                      const score = state.examScores[stu.id]?.[ex.id];
+                      return (score?.rate ?? 1) === 1 && (score?.k == null || score?.s == null);
+                    });
+                    const getColClass = (isError, isWarn) => isTrans ? `${SmallInputClass} opacity-50 bg-slate-100 text-slate-400` : isError ? `${SmallInputClass} !border-rose-400 !bg-rose-50 !text-rose-700` : isWarn ? `${SmallInputClass} !border-amber-400 !bg-amber-50` : SmallInputClass;
+
+                    return (
+                      <tr key={stu.id} className={isTrans ? 'bg-slate-50/80' : 'hover:bg-slate-50/60'}>
+                        <td className="px-1 py-1.5"><button onClick={() => update(s => { s.students = s.students.filter(st => st.id !== stu.id); delete s.examScores[stu.id]; delete s.regularScores[stu.id]; })} className="w-8 h-8 flex items-center justify-center text-slate-400 hover:text-rose-500 cursor-pointer" title="生徒を削除"><i className="ri-delete-bin-line"></i></button></td>
+                        {columns.map(col => {
+                          const val = stu[col];
+                          const onChange = (e) => update(s => { s.students[stuIdx][col] = col === 'no' ? Number(e.target.value) : e.target.value; });
+                          const onPaste = (e) => handlePaste(e, filteredIdx, columns.indexOf(col));
+                          const cls = isTrans ? `${InputClass} opacity-50 bg-slate-100 text-slate-400` : InputClass;
+                          if (col === 'no') return <td key={col} className="px-2 py-1.5"><input type="number" className={`${cls} !w-14`} value={val} onChange={onChange} onPaste={onPaste} /></td>;
+                          if (col === 'cls') return <td key={col} className="px-2 py-1.5"><input className={`${cls} !w-16`} value={val} onChange={onChange} onPaste={onPaste} /></td>;
+                          if (col === 'course') return <td key={col} className="px-2 py-1.5"><input className={`${cls} !w-20`} value={val} onChange={onChange} onPaste={onPaste} /></td>;
+                          return <td key={col} className="px-2 py-1.5"><input className={isTrans ? cls : isWarning ? `${InputClass} !border-amber-400 !bg-amber-50` : InputClass} value={val} onChange={onChange} onPaste={onPaste} /></td>;
+                        })}
+                        {exams.map((ex, exIdx) => {
+                          const score = state.examScores[stu.id]?.[ex.id] ?? { status: 'attend', rate: 1, k: null, s: null, t: null };
+                          const validScores = [score.k, score.s, score.t].filter(v => typeof v === 'number');
+                          const total = validScores.length ? validScores.reduce((a, b) => a + b, 0) : null;
+                          const isOver = total != null && total > (ex.maxK + ex.maxS + ex.maxT);
+                          const isWarn = !isTrans && hasName && score.rate === 1;
+                          const updateScore = (data) => update(s => { s.examScores[stu.id] ??= {}; s.examScores[stu.id][ex.id] = { ...(s.examScores[stu.id][ex.id] ?? { status: 'attend', rate: 1, k: null, s: null, t: null }), ...data }; });
+
+                          return (
+                            <Fragment key={ex.id}>
+                              <td className="px-1 py-1.5 bg-sky-50/20 border-l border-sky-50">
+                                <select className={`w-16 text-xs border border-slate-300 rounded-md px-1 py-1 focus:outline-none focus:border-emerald-500 ${isTrans ? 'opacity-50 bg-slate-100 text-slate-400' : ''}`} value={score.status} onChange={e => { const st = statuses.find(s => s.id === e.target.value); updateScore({ status: e.target.value, rate: st?.rate ?? 1 }); }}>
+                                  {statuses.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                                </select>
+                              </td>
+                              <td className="px-1 py-1.5 bg-sky-50/20"><input type="number" step="0.1" className={`${isTrans ? `${SmallInputClass} opacity-50 bg-slate-100 text-slate-400` : SmallInputClass} !w-14`} value={score.rate} onChange={e => updateScore({ rate: Number(e.target.value) })} /></td>
+                              {['k', 's', 't'].map(vp => {
+                                const val = score[vp];
+                                const max = vp === 'k' ? ex.maxK : vp === 's' ? ex.maxS : ex.maxT;
+                                const colIdx = 4 + exIdx * 2 + (vp === 's' ? 1 : 0); // ペースト用のインデックス計算（簡易）
+                                return (
+                                  <td key={vp} className="px-1 py-1.5 bg-sky-50/20">
+                                    <input type="number" className={getColClass(typeof val === 'number' && val > max, isWarn && val == null)} value={val ?? ''} onChange={e => updateScore({ [vp]: e.target.value === '' ? null : Number(e.target.value) })} onPaste={vp !== 't' ? e => handlePaste(e, filteredIdx, colIdx) : undefined} />
+                                  </td>
+                                );
+                              })}
+                              <td className="px-1 py-1.5 bg-sky-50/20 text-center"><span className={`text-xs font-semibold ${isTrans ? 'text-slate-300' : isOver ? 'text-rose-600' : 'text-sky-700'}`}>{total == null ? '' : round1(total)}</span></td>
+                            </Fragment>
+                          );
+                        })}
+                        {regularItems.map((item, itemIdx) => {
+                          const val = state.regularScores[stu.id]?.[item.id];
+                          const isOver = typeof val === 'number' && val > item.max;
+                          return (
+                            <td key={item.id} className="px-1 py-1.5 bg-amber-50/20 border-l border-amber-50">
+                              <input type="number" className={getColClass(isOver, false)} value={val ?? ''} onChange={e => update(s => { s.regularScores[stu.id] ??= {}; s.regularScores[stu.id][item.id] = e.target.value === '' ? null : Number(e.target.value); })} onPaste={e => handlePaste(e, filteredIdx, 4 + exams.length * 2 + itemIdx)} />
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </Section>
+        </div>
+      );
+    };
+
+    // --- 成績一覧タブ ---
+    const ResultsTab = ({ state }) => {
+      const results = useMemo(() => calculateAllResults(state), [state]);
+      const terms = state.settings.terms;
+      const classes = useMemo(() => [...new Set(state.students.map(s => s.cls))].filter(Boolean).sort(), [state.students]);
+      const courses = useMemo(() => [...new Set(state.students.map(s => s.course).filter(Boolean))].sort(), [state.students]);
+      const finalGrades = useMemo(() => state.settings.finalScale.map(s => Number(s.label)).filter(Number.isFinite).sort((a, b) => b - a), [state.settings.finalScale]);
+
+      const [filters, setFilters] = useState({ cls: [], course: [], termGrades: {}, annualGrades: [], ranges: {} });
+      const [isStatsOpen, setIsStatsOpen] = useState(true);
+
+      const toggleFilter = (key, val) => setFilters(prev => ({ ...prev, [key]: prev[key].includes(val) ? prev[key].filter(v => v !== val) : [...prev[key], val] }));
+      const toggleTermGrade = (termId, val) => setFilters(prev => { const arr = prev.termGrades[termId] ?? []; return { ...prev, termGrades: { ...prev.termGrades, [termId]: arr.includes(val) ? arr.filter(v => v !== val) : [...arr, val] } }; });
+      const setRange = (termId, key, type, val) => setFilters(prev => { const rKey = `${termId}:${key}`; const current = prev.ranges[rKey] ?? { min: '', max: '' }; return { ...prev, ranges: { ...prev.ranges, [rKey]: { ...current, [type]: val } } }; });
+      const clearRange = (termId, key) => setFilters(prev => { const next = { ...prev.ranges }; delete next[`${termId}:${key}`]; return { ...prev, ranges: next }; });
+      const getRange = (termId, key) => filters.ranges[`${termId}:${key}`] ?? { min: '', max: '' };
+      const isRangeActive = (termId, key) => { const r = filters.ranges[`${termId}:${key}`]; return !!r && (r.min !== '' || r.max !== ''); };
+      const clearAllFilters = () => setFilters({ cls: [], course: [], termGrades: {}, annualGrades: [], ranges: {} });
+
+      const isFiltering = filters.cls.length > 0 || filters.course.length > 0 || Object.values(filters.termGrades).some(arr => arr.length > 0) || filters.annualGrades.length > 0 || Object.keys(filters.ranges).length > 0;
+
+      const filteredResults = useMemo(() => results.filter(res => {
+        if (filters.cls.length && !filters.cls.includes(res.cls)) return false;
+        if (filters.course.length && !filters.course.includes(res.course)) return false;
+        for (const term of terms) {
+          const tg = filters.termGrades[term.id] ?? [];
+          if (tg.length) {
+            const tr = res.terms.find(t => t.termId === term.id);
+            const label = tr?.finalLabel == null ? NaN : Number(tr.finalLabel);
+            if (!Number.isFinite(label) || !tg.includes(label)) return false;
+          }
+        }
+        if (filters.annualGrades.length) {
+          const label = res.annualLabel == null ? NaN : Number(res.annualLabel);
+          if (!Number.isFinite(label) || !filters.annualGrades.includes(label)) return false;
+        }
+        for (const term of terms) {
+          const tr = res.terms.find(t => t.termId === term.id);
+          if (tr) {
+            for (const col of [{ key: 'examAvg' }, { key: 'k' }, { key: 's' }, { key: 't' }, { key: 'sum' }]) {
+              const { min, max } = getRange(term.id, col.key);
+              const minVal = parseFloatSafe(min), maxVal = parseFloatSafe(max);
+              const val = col.key === 'examAvg' ? tr.examAverage : col.key === 'sum' ? (Object.values(tr.viewpoints).some(vp => vp.grade) ? tr.sumValue : null) : (tr.viewpoints[col.key].grade ? tr.viewpoints[col.key].point : null);
+              if ((minVal != null || maxVal != null) && !isWithinRange(val, minVal, maxVal)) return false;
+            }
+          }
+        }
+        return true;
+      }), [results, filters, terms]);
+
+      const validResults = useMemo(() => filteredResults.filter(r => !r.transferred), [filteredResults]);
+
+      const termAvgs = useMemo(() => terms.map((term, i) => ({
+        examAvg: calculateAverage(validResults.map(r => r.terms[i].examAverage)),
+        k: calculateAverage(validResults.map(r => r.terms[i].viewpoints.k.grade ? r.terms[i].viewpoints.k.point : null)),
+        s: calculateAverage(validResults.map(r => r.terms[i].viewpoints.s.grade ? r.terms[i].viewpoints.s.point : null)),
+        t: calculateAverage(validResults.map(r => r.terms[i].viewpoints.t.grade ? r.terms[i].viewpoints.t.point : null)),
+        sumAvg: calculateAverage(validResults.filter(r => Object.values(r.terms[i].viewpoints).some(vp => vp.grade)).map(r => r.terms[i].sumValue))
+      })), [validResults, terms]);
+
+      const stats = useMemo(() => {
+        const calcStat = (arr) => {
+          if (!arr.length) return { avg: null, sd: null, dist: new Map(), total: 0 };
+          const avg = arr.reduce((sum, x) => sum + x, 0) / arr.length;
+          const sd = Math.sqrt(arr.reduce((sum, x) => sum + (x - avg) ** 2, 0) / arr.length);
+          const dist = new Map();
+          arr.forEach(x => dist.set(x, (dist.get(x) ?? 0) + 1));
+          return { avg, sd, dist, total: arr.length };
+        };
+        const getNum = (val) => { const n = Number(val); return Number.isFinite(n) ? n : null; };
+        return {
+          termStats: terms.map((term, i) => calcStat(validResults.map(r => getNum(r.terms[i].finalLabel)).filter(x => x != null))),
+          annual: calcStat(validResults.map(r => getNum(r.annualLabel)).filter(x => x != null))
+        };
+      }, [validResults, terms]);
+
+      return (
+        <Section title="成績一覧(自動集計)" icon="ri-bar-chart-2-line" desc="試験平均・観点別評点・評価・換算値・評定を一覧表示します。見出しの漏斗アイコンからエクセルのように絞り込みでき、絞り込みに応じて平均・統計が再計算されます">
+          
+          <div className="flex flex-wrap gap-4 mb-4 text-[11px] text-slate-500">
+            {state.settings.gradeScale.map(gs => (
+              <span key={gs.id} className="inline-flex items-center gap-1.5">
+                <span className={`inline-flex items-center justify-center min-w-[30px] px-2 py-0.5 rounded-md font-semibold ${getToneClass(gs.tone)}`}>{gs.label}</span>
+                ≥ {(gs.minRatio * 100).toFixed(0)}% (換算値 {gs.value})
+              </span>
+            ))}
+          </div>
+
+          <div className="mb-5 border-b border-slate-200 pb-5">
+            <div className="flex items-center justify-between cursor-pointer group" onClick={() => setIsStatsOpen(!isStatsOpen)}>
+              <div className="flex items-center gap-2">
+                <i className="ri-line-chart-line text-emerald-600"></i>
+                <h4 className="text-sm font-semibold text-slate-700 group-hover:text-emerald-500 transition-colors">評定の統計（平均・標準偏差・割合）</h4>
+                <span className="text-xs text-slate-400">対象 {validResults.length} 名</span>
+              </div>
+              <button className="text-slate-400 group-hover:text-emerald-500 transition-colors focus:outline-none">
+                <i className={isStatsOpen ? "ri-arrow-up-s-line text-xl" : "ri-arrow-down-s-line text-xl"}></i>
+              </button>
+            </div>
+            
+            {isStatsOpen && (
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
+                {[...terms.map((t, i) => ({ key: t.id, title: t.name, s: stats.termStats[i] })), { key: 'annual', title: '年間', s: stats.annual }].map(stat => (
+                  <div key={stat.key} className="rounded-lg border border-slate-200 bg-slate-50/70 p-4">
+                    <div className="text-xs font-semibold text-slate-600 mb-3">{stat.title}</div>
+                    <div className="flex flex-wrap gap-x-6 gap-y-2 mb-4 text-xs">
+                      <span className="inline-flex items-center gap-1 text-slate-500">平均<span className="font-semibold text-slate-800">{stat.s.avg == null ? '–' : stat.s.avg.toFixed(2)}</span></span>
+                      <span className="inline-flex items-center gap-1 text-slate-500">標準偏差<span className="font-semibold text-slate-800">{stat.s.sd == null ? '–' : stat.s.sd.toFixed(2)}</span></span>
+                    </div>
+                    <div className="space-y-1.5">
+                      {finalGrades.map(grade => {
+                        const count = stat.s.dist.get(grade) ?? 0;
+                        const pct = stat.s.total ? (count / stat.s.total) * 100 : 0;
+                        return (
+                          <div key={grade} className="flex items-center gap-2">
+                            <span className="w-5 text-right text-xs font-semibold text-slate-600">{grade}</span>
+                            <div className="flex-1 h-2 rounded-full bg-slate-100 overflow-hidden">
+                              <div className={`h-full rounded-full ${getGradeColor(grade)}`} style={{ width: `${pct}%` }}></div>
+                            </div>
+                            <span className="w-24 text-right text-[11px] text-slate-500 whitespace-nowrap">{count}人 ({pct.toFixed(0)}%)</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center gap-2 text-xs text-slate-500">
+              <i className="ri-filter-3-line text-emerald-600"></i>
+              <span>{filteredResults.length} 件表示</span>
+              {isFiltering && <span className="text-emerald-600 font-medium">絞り込み中</span>}
+            </div>
+            {isFiltering && (
+              <button type="button" onClick={clearAllFilters} className="px-2.5 py-1 text-xs rounded-md text-slate-500 hover:text-emerald-700 hover:bg-emerald-50 cursor-pointer transition whitespace-nowrap">
+                <i className="ri-eraser-line mr-1"></i>絞り込みをクリア
+              </button>
+            )}
+          </div>
+
+          <div className="overflow-auto max-h-[70vh] rounded-lg border border-slate-200">
+            <table className="min-w-full text-sm border-separate border-spacing-0">
+              <thead className="sticky top-0 z-10">
+                <tr className="text-[11px] text-slate-500">
+                  <th rowSpan={3} className="px-2 py-2 text-left align-middle bg-slate-100 border-b border-slate-200">No</th>
+                  <th rowSpan={3} className="px-2 py-2 text-left align-middle bg-slate-100 border-b border-slate-200">
+                    <div className="flex items-center">
+                      <span>クラス</span>
+                      <FilterPopover label="クラス" active={filters.cls.length > 0} onClear={() => setFilters(p => ({ ...p, cls: [] }))}>
+                        <CheckboxFilter options={classes.map(c => ({ value: c, label: c }))} selected={filters.cls} onToggle={v => toggleFilter('cls', v)} />
+                      </FilterPopover>
+                    </div>
+                  </th>
+                  <th rowSpan={3} className="px-2 py-2 text-left align-middle bg-slate-100 border-b border-slate-200">
+                    <div className="flex items-center">
+                      <span>コース</span>
+                      <FilterPopover label="コース" active={filters.course.length > 0} onClear={() => setFilters(p => ({ ...p, course: [] }))}>
+                        <CheckboxFilter options={courses.map(c => ({ value: c, label: c }))} selected={filters.course} onToggle={v => toggleFilter('course', v)} />
+                      </FilterPopover>
+                    </div>
+                  </th>
+                  <th rowSpan={3} className="px-2 py-2 text-left align-middle bg-slate-100 border-b border-slate-200">氏名</th>
+                  {terms.map(term => <th key={term.id} colSpan={6} className="px-2 py-1.5 border-l border-slate-200 text-center font-semibold bg-slate-100 border-b border-slate-200">{term.name}</th>)}
+                  <th className="px-2 py-1 border-l border-slate-200 text-center bg-emerald-100 border-b border-slate-200">
+                    <span className="block text-[9px] font-normal leading-tight text-emerald-700">平均</span>
+                    <span className="font-semibold text-emerald-800">{stats.annual.avg == null ? '–' : stats.annual.avg.toFixed(1)}</span>
+                  </th>
+                </tr>
+                <tr className="text-[10px]">
+                  {termAvgs.map((avg, i) => (
+                    <Fragment key={terms[i].id}>
+                      <th className="px-1.5 py-1 border-l border-slate-200 bg-emerald-100 border-b border-slate-200"><span className="block text-[9px] font-normal leading-tight text-emerald-700">平均</span><span className="font-semibold text-emerald-800">{avg.examAvg == null ? '–' : avg.examAvg.toFixed(1)}</span></th>
+                      <th className="px-1.5 py-1 bg-emerald-100 border-b border-slate-200"><span className="block text-[9px] font-normal leading-tight text-emerald-700">平均</span><span className="font-semibold text-emerald-800">{avg.k == null ? '–' : avg.k.toFixed(1)}</span></th>
+                      <th className="px-1.5 py-1 bg-emerald-100 border-b border-slate-200"><span className="block text-[9px] font-normal leading-tight text-emerald-700">平均</span><span className="font-semibold text-emerald-800">{avg.s == null ? '–' : avg.s.toFixed(1)}</span></th>
+                      <th className="px-1.5 py-1 bg-emerald-100 border-b border-slate-200"><span className="block text-[9px] font-normal leading-tight text-emerald-700">平均</span><span className="font-semibold text-emerald-800">{avg.t == null ? '–' : avg.t.toFixed(1)}</span></th>
+                      <th className="px-1.5 py-1 bg-emerald-100 border-b border-slate-200"><span className="block text-[9px] font-normal leading-tight text-emerald-700">平均</span><span className="font-semibold text-emerald-800">{avg.sumAvg == null ? '–' : avg.sumAvg.toFixed(1)}</span></th>
+                      <th className="px-1.5 py-1 bg-emerald-100 border-b border-slate-200"><span className="block text-[9px] font-normal leading-tight text-emerald-700">平均</span><span className="font-semibold text-emerald-800">{stats.termStats[i].avg == null ? '–' : stats.termStats[i].avg.toFixed(1)}</span></th>
+                    </Fragment>
+                  ))}
+                  <th rowSpan={2} className="px-2 py-2 border-l border-slate-200 text-center align-middle bg-emerald-100 text-emerald-700 font-semibold whitespace-nowrap border-b border-emerald-200">
+                    <div className="flex items-center justify-center">
+                      <span>年間評定</span>
+                      <FilterPopover label="年間評定" active={filters.annualGrades.length > 0} onClear={() => setFilters(p => ({ ...p, annualGrades: [] }))}>
+                        <CheckboxFilter options={finalGrades.map(g => ({ value: String(g), label: String(g) }))} selected={filters.annualGrades.map(String)} onToggle={v => toggleFilter('annualGrades', Number(v))} />
+                      </FilterPopover>
+                    </div>
+                  </th>
+                </tr>
+                <tr className="text-[11px] text-slate-500">
+                  {terms.map(term => (
+                    <Fragment key={term.id}>
+                      {[{ key: 'examAvg', label: '試験平均点' }, { key: 'k', label: '知識' }, { key: 's', label: '思考' }, { key: 't', label: '態度' }, { key: 'sum', label: '換算合計' }].map((col, idx) => (
+                        <th key={col.key} className={`px-1.5 py-1 bg-slate-100 border-b border-slate-200 ${idx === 0 ? 'border-l border-slate-200' : ''}`}>
+                          <div className="flex items-center justify-center">
+                            <span className="whitespace-nowrap">{col.label}</span>
+                            <FilterPopover label={`${term.name} ${col.label}`} active={isRangeActive(term.id, col.key)} onClear={() => clearRange(term.id, col.key)}>
+                              <RangeFilter min={getRange(term.id, col.key).min} max={getRange(term.id, col.key).max} onMin={v => setRange(term.id, col.key, 'min', v)} onMax={v => setRange(term.id, col.key, 'max', v)} />
+                            </FilterPopover>
+                          </div>
+                        </th>
+                      ))}
+                      <th className="px-1.5 py-1 bg-slate-100 border-b border-slate-200">
+                        <div className="flex items-center justify-center">
+                          <span className="whitespace-nowrap">評定</span>
+                          <FilterPopover label={`${term.name} 評定`} active={(filters.termGrades[term.id] ?? []).length > 0} onClear={() => setFilters(p => ({ ...p, termGrades: { ...p.termGrades, [term.id]: [] } }))}>
+                            <CheckboxFilter options={finalGrades.map(g => ({ value: String(g), label: String(g) }))} selected={(filters.termGrades[term.id] ?? []).map(String)} onToggle={v => toggleTermGrade(term.id, Number(v))} />
+                          </FilterPopover>
+                        </div>
+                      </th>
+                    </Fragment>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {filteredResults.length === 0 ? (
+                  <tr><td colSpan={100} className="px-4 py-8 text-center text-slate-400 text-sm">該当する生徒がいません</td></tr>
+                ) : filteredResults.map(res => (
+                  <tr key={res.studentId} className={res.transferred ? 'bg-slate-50/80' : 'hover:bg-slate-50/50'}>
+                    <td className={`px-2 py-2 ${res.transferred ? 'text-slate-400' : 'text-slate-500'}`}>{res.no}</td>
+                    <td className={`px-2 py-2 ${res.transferred ? 'text-slate-400' : 'text-slate-500'}`}>{res.cls}</td>
+                    <td className={`px-2 py-2 ${res.transferred ? 'text-slate-400' : 'text-slate-500'}`}>{res.course}</td>
+                    <td className={`px-2 py-2 font-medium whitespace-nowrap ${res.transferred ? 'text-slate-400' : 'text-slate-800'}`}>{res.name}</td>
+                    {res.terms.map(t => (
+                      <Fragment key={t.termId}>
+                        <td className="px-1.5 py-2 text-center border-l border-slate-100 text-slate-600">{res.transferred ? <span className="text-slate-400">欠</span> : t.examAverage == null ? '-' : t.examAverage.toFixed(1)}</td>
+                        {VIEWPOINTS.map(vp => {
+                          const r = t.viewpoints[vp.key];
+                          return (
+                            <td key={vp.key} className="px-1.5 py-2 text-center border-l border-slate-100">
+                              {res.transferred ? <span className="text-slate-400">欠</span> : r.grade ? (
+                                <div className="flex flex-col items-center gap-0.5">
+                                  <span className="text-sm font-semibold text-slate-800">{r.point.toFixed(1)}</span>
+                                  <span className={`inline-flex items-center justify-center min-w-[32px] px-1.5 py-0.5 rounded-md text-[11px] font-semibold ${getToneClass(r.grade.tone)}`}>{r.grade.label}</span>
+                                </div>
+                              ) : <span className="text-slate-300">-</span>}
+                            </td>
+                          );
+                        })}
+                        <td className="px-1.5 py-2 text-center text-slate-600 font-medium">{res.transferred ? <span className="text-slate-400">欠</span> : t.sumValue}</td>
+                        <td className="px-1.5 py-2 text-center">{res.transferred ? <span className="inline-flex items-center justify-center w-7 h-7 rounded-full bg-slate-200 text-slate-400 text-sm font-bold">欠</span> : <span className="inline-flex items-center justify-center w-7 h-7 rounded-full bg-slate-700 text-white text-sm font-bold">{t.finalLabel ?? '-'}</span>}</td>
+                      </Fragment>
+                    ))}
+                    <td className="px-2 py-2 text-center border-l border-slate-200 bg-emerald-50/50">{res.transferred ? <span className="inline-flex items-center justify-center w-9 h-9 rounded-full bg-slate-200 text-slate-400 text-base font-bold">欠</span> : <span className="inline-flex items-center justify-center w-9 h-9 rounded-full bg-emerald-500 text-white text-base font-bold">{res.annualLabel ?? '-'}</span>}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Section>
+      );
+    };
+
+    // --- メインアプリケーション ---
+    const App = () => {
+      const { state, setState, reset } = useAppState();
+      const [activeTab, setActiveTab] = useState('input');
+      const [toastMsg, setToastMsg] = useState(null);
+      const [showResetConfirm, setShowResetConfirm] = useState(false);
+      const fileInputRef = useRef(null);
+
+      const showToast = (msg) => { setToastMsg(msg); setTimeout(() => setToastMsg(null), 2000); };
+
+      const downloadFile = (content, filename, type) => {
+        const blob = new Blob([content], { type });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = filename; a.click();
+        URL.revokeObjectURL(url);
+      };
+
+      const exportJSON = () => {
+        downloadFile(JSON.stringify(state, null, 2), `grade-data-${new Date().toISOString().slice(0, 10)}.json`, 'application/json');
+        showToast('JSON をエクスポートしました');
+      };
+
+      const exportCSV = () => {
+        const results = calculateAllResults(state);
+        const header = ['No', 'クラス', 'コース', '氏名'];
+        state.settings.terms.forEach(term => {
+          VIEWPOINTS.forEach(vp => header.push(`${term.name}${vp.label}`));
+          header.push(`${term.name}換算合計`, `${term.name}評定`);
+        });
+        header.push('年間評定');
+        
+        const rows = [header];
+        results.forEach(res => {
+          const row = [String(res.no), res.cls, res.course, res.name];
+          res.terms.forEach(term => {
+            VIEWPOINTS.forEach(vp => row.push(res.transferred ? '欠' : (term.viewpoints[vp.key].grade?.label ?? '')));
+            row.push(res.transferred ? '欠' : String(term.sumValue), res.transferred ? '欠' : (term.finalLabel ?? ''));
+          });
+          row.push(res.transferred ? '欠' : (res.annualLabel ?? ''));
+          rows.push(row);
+        });
+        
+        const csv = '\uFEFF' + rows.map(r => r.map(c => `"${c.replace(/"/g, '""')}"`).join(',')).join('\n');
+        downloadFile(csv, `results-${new Date().toISOString().slice(0, 10)}.csv`, 'text/csv');
+        showToast('成績をCSVで出力しました');
+      };
+
+      const importJSON = (e) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+          try {
+            setState(migrateState(JSON.parse(String(reader.result))));
+            showToast('データを読み込みました');
+          } catch { showToast('読み込みに失敗しました'); }
+        };
+        reader.readAsText(file);
+        e.target.value = '';
+      };
+
+      const saveOffline = () => {
+        const html = document.documentElement.outerHTML;
+        const scriptTag = `<script>window.__INITIAL_STATE__ = ${JSON.stringify(state)};<\/script>`;
+        let newHtml;
+        if (html.includes('window.__INITIAL_STATE__')) {
+          newHtml = html.replace(/<script>window\.__INITIAL_STATE__[\s\S]*?<\/script>/, scriptTag);
+        } else {
+          newHtml = html.replace('<head>', `<head>\n  ${scriptTag}`);
+        }
+        downloadFile(`<!DOCTYPE html>\n${newHtml}`, `grade-app-offline-${new Date().toISOString().slice(0,10)}.html`, 'text/html');
+        showToast('オフライン用HTMLを保存しました');
+      };
+
+      return (
+        <div className="min-h-screen bg-slate-50 text-slate-800 font-sans">
+          <div className="sticky top-0 z-30 bg-white/95 backdrop-blur border-b border-slate-200 shadow-sm">
+            <div className="w-[95%] mx-auto px-6">
+              <div className="py-3 flex items-center justify-between gap-4 flex-wrap">
+                <div className="flex items-center gap-3">
+                  <div className="w-9 h-9 flex items-center justify-center rounded-lg bg-emerald-500 text-white shadow-sm">
+                    <i className="ri-book-open-line text-lg"></i>
+                  </div>
+                  <div>
+                    <h1 className="text-base font-semibold text-slate-800">成績処理システム</h1>
+                    <p className="text-xs text-slate-500">3観点評価 → 換算値 → 評定</p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <button onClick={saveOffline} className="px-3 py-1.5 text-xs rounded-md bg-emerald-500 text-white hover:bg-emerald-600 whitespace-nowrap cursor-pointer inline-flex items-center gap-1.5 shadow-sm"><i className="ri-download-cloud-2-line"></i>オフライン保存</button>
+                  <button onClick={exportJSON} className="px-3 py-1.5 text-xs rounded-md border border-slate-200 text-slate-700 hover:bg-slate-100 whitespace-nowrap cursor-pointer inline-flex items-center gap-1.5"><i className="ri-download-line"></i>JSON保存</button>
+                  <button onClick={exportCSV} className="px-3 py-1.5 text-xs rounded-md border border-slate-200 text-slate-700 hover:bg-slate-100 whitespace-nowrap cursor-pointer inline-flex items-center gap-1.5"><i className="ri-file-excel-2-line"></i>成績CSV</button>
+                  <button onClick={() => fileInputRef.current?.click()} className="px-3 py-1.5 text-xs rounded-md border border-slate-200 text-slate-700 hover:bg-slate-100 whitespace-nowrap cursor-pointer inline-flex items-center gap-1.5"><i className="ri-upload-line"></i>読込</button>
+                  <input ref={fileInputRef} type="file" accept=".json" className="hidden" onChange={importJSON} />
+                  <button onClick={() => setShowResetConfirm(true)} className="px-3 py-1.5 text-xs rounded-md bg-rose-50 border border-rose-200 text-rose-600 hover:bg-rose-100 whitespace-nowrap cursor-pointer inline-flex items-center gap-1.5"><i className="ri-refresh-line"></i>初期化</button>
+                </div>
+              </div>
+              <Tabs tabs={TABS} current={activeTab} onChange={setActiveTab} />
+            </div>
+          </div>
+
+          <main className="w-[95%] mx-auto px-6 py-6">
+            {activeTab === 'input' && <InputTab state={state} setState={setState} showToast={showToast} />}
+            {activeTab === 'results' && <ResultsTab state={state} />}
+            {activeTab === 'settings' && <SettingsTab state={state} setState={setState} />}
+          </main>
+
+          {toastMsg && <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 px-4 py-2 rounded-lg bg-slate-800 text-white text-sm shadow-lg animate-fade-in-up">{toastMsg}</div>}
+
+          {showResetConfirm && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm">
+              <div className="bg-white rounded-lg p-6 w-[340px] shadow-xl">
+                <h3 className="text-sm font-semibold text-slate-800 mb-2">初期化の確認</h3>
+                <p className="text-xs text-slate-500 mb-5 leading-relaxed">入力中のデータをすべて消してサンプルの初期状態に戻します。よろしいですか?</p>
+                <div className="flex justify-end gap-2">
+                  <button onClick={() => setShowResetConfirm(false)} className="px-3 py-1.5 text-xs rounded-md border border-slate-200 text-slate-600 hover:bg-slate-100 whitespace-nowrap cursor-pointer">キャンセル</button>
+                  <button onClick={() => { reset(); setShowResetConfirm(false); showToast('初期化しました'); }} className="px-3 py-1.5 text-xs rounded-md bg-rose-500 text-white hover:bg-rose-600 whitespace-nowrap cursor-pointer">初期化する</button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    };
+
+    const root = createRoot(document.getElementById('root'));
+    root.render(<StrictMode><App /></StrictMode>);
+  </script>
+</body>
+</html>
